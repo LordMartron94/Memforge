@@ -3,14 +3,18 @@ package memforge
 import (
 	"fmt"
 	"memcore"
+	"memcore/primitives"
 	"unsafe"
 )
 
-// FixedManualAllocator is a fixed-size allocator which allows for manual freeing.
-// Blazingly fast.
-// NOT thread-safe -- it does not just non-block, it is unsafe to call concurrently.
-// Memory is not moved around, so no compacting, etc.
-// This means returned pointers stay stable.
+// FixedManualAllocator is a fixed-size allocator that allows for manual freeing of memory.
+// It is designed for high performance by avoiding locks and runtime overhead.
+//
+// Key Characteristics:
+//   - Blazingly Fast: Achieves speed through direct memory manipulation.
+//   - NOT Thread-Safe: Concurrent calls will lead to data races and undefined behavior.
+//   - Stable Pointers: Memory is never moved or compacted, ensuring that returned
+//     pointers remain valid for their entire lifetime.
 type FixedManualAllocator struct {
 	storage           memcore.MemoryMap
 	metadataAllocator *FixedLinearAllocator
@@ -18,56 +22,90 @@ type FixedManualAllocator struct {
 	freeMemory memoryFreeRegions
 	ptrRefs    ptrRefTable
 
-	freeMemoryRegionsAmount uint
-	ptrRefAmount            uint
-
 	cap       uint64
 	destroyed bool
 }
 
-// FixedManualAllocatorCreate creates an instance of the linear allocator.
+// FixedManualAllocatorCreate initializes a new manual allocator with a given size.
+//
+// ⚠️ Important: The allocator struct itself contains Go pointers and must reside on
+// the Go heap, visible to the garbage collector. Do NOT allocate this struct in
+// manually-managed memory.
+//
+// You may, however, point its internal data buffer to a manually managed memory
+// region (e.g., from another allocator or a direct mmap call).
+//
+//   - ✅ Safe:   Allocator struct on Go heap, data buffer in manual memory.
+//   - ❌ Unsafe: Allocator struct and data buffer both in manual memory.
 func FixedManualAllocatorCreate(sizeBytes uint) *FixedManualAllocator {
-	mmap, err := memcore.MemmapRequest((int)(sizeBytes), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
-
+	// --- Data Arena ---
+	mmap, err := memcore.MemmapRequest(int(sizeBytes), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
 	if err != nil {
-		panic(fmt.Errorf("failure to create manual allocator: %w", err))
+		panic(fmt.Errorf("failure to create manual allocator data region: %w", err))
 	}
 
+	// --- Metadata Arena ---
 	metadataAllocationSize := max(64*1024, sizeBytes/128)
 	metadataAllocator := FixedLinearAllocatorCreate(int(metadataAllocationSize))
 
-	ptrRefsTableAddr := FixedLinearAllocatorMalloc(metadataAllocator, (uint64)(metadataAllocationSize/2), memcore.AlignOf[ptrRefTable]())
-	freeMemoryAddr := FixedLinearAllocatorMalloc(metadataAllocator, (uint64)(metadataAllocationSize/2), memcore.AlignOf[memoryFreeRegions]())
+	// --- Split Metadata ---
+	ptrRefsTableAddr := FixedLinearAllocatorMalloc(
+		metadataAllocator,
+		uint64(metadataAllocationSize/2),
+		memcore.AlignOf[ptrRecord](),
+	)
+	freeMemoryAddr := FixedLinearAllocatorMalloc(
+		metadataAllocator,
+		uint64(metadataAllocationSize/2),
+		memcore.AlignOf[freeMemoryRegionBlock](),
+	)
 
-	freeMemory := memoryFreeRegions(memcore.ArrayCreateAt[freeMemoryRegionBlock](freeMemoryAddr, uint64(metadataAllocationSize)))
-	memcore.ArraySetAt(freeMemory, 0, freeMemoryRegionBlock{
+	ptrRefCapacity := uint64(metadataAllocationSize/2) / memcore.SizeOf[ptrRecord]()
+	freeMemCapacity := uint64(metadataAllocationSize/2) / memcore.SizeOf[freeMemoryRegionBlock]()
+
+	ptrRefs := ptrRefTable(
+		primitives.FixedOrderedListCreateAt[ptrRecord](ptrRefsTableAddr, ptrRefCapacity),
+	)
+	freeMemory := memoryFreeRegions(
+		primitives.FixedOrderedListCreateAt[freeMemoryRegionBlock](freeMemoryAddr, freeMemCapacity),
+	)
+
+	// Initialize with a single block representing all available memory.
+	primitives.FixedOrderedListInsert(freeMemory, freeMemoryRegionBlock{
 		memStartIdx: 0,
 		sizeBytes:   uint64(sizeBytes),
 	})
 
 	return &FixedManualAllocator{
-		storage:                 mmap,
-		metadataAllocator:       metadataAllocator,
-		cap:                     (uint64)(sizeBytes),
-		ptrRefs:                 ptrRefTable(memcore.ArrayCreateAt[ptrRecord](ptrRefsTableAddr, uint64(metadataAllocationSize))),
-		freeMemory:              freeMemory,
-		freeMemoryRegionsAmount: 1,
-		ptrRefAmount:            0,
-		destroyed:               false,
+		storage:           mmap,
+		metadataAllocator: metadataAllocator,
+		cap:               uint64(sizeBytes),
+		ptrRefs:           ptrRefs,
+		freeMemory:        freeMemory,
+		destroyed:         false,
 	}
 }
 
-// FixedManualAllocatorDestroy destroys the allocator and cleans up.
-// Do NOT use the allocator anymore.
+// FixedManualAllocatorDestroy releases all resources used by the allocator.
+// Using the allocator after destruction will result in a panic.
 func FixedManualAllocatorDestroy(allocator *FixedManualAllocator) {
+	if allocator == nil || allocator.destroyed {
+		return
+	}
 	memcore.MemmapUnmap(allocator.storage)
+	memcore.MemmapUnmap(allocator.metadataAllocator.storage)
+	allocator.freeMemory = nil
+	allocator.ptrRefs = nil
+	allocator.metadataAllocator = nil
 	*allocator = FixedManualAllocator{destroyed: true}
 }
 
-// FixedManualAllocatorMalloc allocates X amount of bytes from the allocator.
-// It does not zero the memory, therefore it may contain garbage.
-// Storing Go pointers ANYWHERE inside this allocation results in undefined behaviour.
-// Requesting 0 bytes returns an aligned pointer but does not change the allocator state.
+// FixedManualAllocatorMalloc allocates a block of memory of `sizeBytes` with the
+// specified `alignment`. The memory is not zeroed and may contain garbage.
+//
+// Storing Go pointers in this memory results in undefined behavior.
+// Requesting 0 bytes returns an aligned pointer but does not change allocator state.
+// Panics if no suitable memory region is found.
 //
 //go:nosplit
 func FixedManualAllocatorMalloc(instance *FixedManualAllocator, sizeBytes uint64, alignment uint64) unsafe.Pointer {
@@ -75,104 +113,37 @@ func FixedManualAllocatorMalloc(instance *FixedManualAllocator, sizeBytes uint64
 	alignmentValidate(alignment)
 
 	regionIdx, alignedIdx, spaceBefore, spaceAfter, err := getFreeAlignedIdx(instance, sizeBytes, alignment)
-
 	if err != nil {
 		panic("cannot allocate more memory than available")
 	}
 
-	memcore.ArrayDeleteAtUnsafe(instance.freeMemory, uint64(regionIdx))
-	instance.freeMemoryRegionsAmount--
-
-	if spaceBefore > 0 {
-		memcore.ArraySetAtUnsafe(instance.freeMemory, uint64(regionIdx), freeMemoryRegionBlock{
-			memStartIdx: alignedIdx - spaceBefore,
-			sizeBytes:   spaceBefore,
-		})
-		instance.freeMemoryRegionsAmount++
-
-		if spaceAfter > 0 {
-			memcore.ArrayInsertAtUnsafe(instance.freeMemory, uint64(regionIdx+1), freeMemoryRegionBlock{
-				memStartIdx: alignedIdx + sizeBytes,
-				sizeBytes:   spaceAfter,
-			})
-			instance.freeMemoryRegionsAmount++
-		}
-	} else if spaceAfter > 0 {
-		memcore.ArraySetAtUnsafe(instance.freeMemory, uint64(regionIdx), freeMemoryRegionBlock{
-			memStartIdx: alignedIdx + sizeBytes,
-			sizeBytes:   spaceAfter,
-		})
-		instance.freeMemoryRegionsAmount++
-	}
+	updateFreeListAfterAllocation(instance, regionIdx, alignedIdx, sizeBytes, spaceBefore, spaceAfter)
 
 	ptr := unsafe.Pointer(&instance.storage[alignedIdx])
-
-	memcore.ArraySetAtUnsafe(instance.ptrRefs, uint64(instance.ptrRefAmount), ptrRecord{
-		key:       uintptr(ptr),
-		idx:       alignedIdx,
-		sizeBytes: sizeBytes,
-	})
-
-	instance.ptrRefAmount++
-
+	insertPtrRecord(instance, ptr, alignedIdx, sizeBytes)
 	return ptr
 }
 
-// FixedManualAllocatorMallocUnsafe allocates X amount of bytes from the allocator.
-// It does not zero the memory, therefore it may contain garbage.
-// Storing Go pointers ANYWHERE inside this allocation results in undefined behaviour.
-// Requesting 0 bytes returns an aligned pointer but does not change the allocator state.
-// The unsafe version skips the alignment validation and the existence guarantee for the sake of performance.
+// FixedManualAllocatorMallocUnsafe is a faster version of Malloc that skips
+// alignment validation. Use only when alignment is guaranteed to be a power of two.
 //
 //go:nosplit
 func FixedManualAllocatorMallocUnsafe(instance *FixedManualAllocator, sizeBytes uint64, alignment uint64) unsafe.Pointer {
-	regionIdx, alignedIdx, spaceBefore, spaceAfter, err := getFreeAlignedIdx(instance, sizeBytes, alignment)
+	fixedManualAllocatorNotDestroyedGuarantee(instance)
 
+	regionIdx, alignedIdx, spaceBefore, spaceAfter, err := getFreeAlignedIdx(instance, sizeBytes, alignment)
 	if err != nil {
 		panic("cannot allocate more memory than available")
 	}
 
-	memcore.ArrayDeleteAt(instance.freeMemory, uint64(regionIdx))
-	instance.freeMemoryRegionsAmount--
-
-	if spaceBefore > 0 {
-		memcore.ArraySetAtUnsafe(instance.freeMemory, uint64(regionIdx), freeMemoryRegionBlock{
-			memStartIdx: alignedIdx - spaceBefore,
-			sizeBytes:   spaceBefore,
-		})
-		instance.freeMemoryRegionsAmount++
-
-		if spaceAfter > 0 {
-			memcore.ArrayInsertAtUnsafe(instance.freeMemory, uint64(regionIdx+1), freeMemoryRegionBlock{
-				memStartIdx: alignedIdx + sizeBytes,
-				sizeBytes:   spaceAfter,
-			})
-			instance.freeMemoryRegionsAmount++
-		}
-	} else if spaceAfter > 0 {
-		memcore.ArraySetAtUnsafe(instance.freeMemory, uint64(regionIdx), freeMemoryRegionBlock{
-			memStartIdx: alignedIdx + sizeBytes,
-			sizeBytes:   spaceAfter,
-		})
-		instance.freeMemoryRegionsAmount++
-	}
+	updateFreeListAfterAllocation(instance, regionIdx, alignedIdx, sizeBytes, spaceBefore, spaceAfter)
 
 	ptr := unsafe.Pointer(&instance.storage[alignedIdx])
-
-	memcore.ArraySetAtUnsafe(instance.ptrRefs, uint64(instance.ptrRefAmount), ptrRecord{
-		key:       uintptr(ptr),
-		idx:       alignedIdx,
-		sizeBytes: sizeBytes,
-	})
-
-	instance.ptrRefAmount++
-
+	insertPtrRecord(instance, ptr, alignedIdx, sizeBytes)
 	return ptr
 }
 
-// FixedManualAllocatorCalloc is similar to FixedManualAllocatorMalloc, except it also zeroes out the memory.
-// Note: This is quite expensive (especially for larger amounts of memory),
-// so avoid using it if at all possible.
+// FixedManualAllocatorCalloc allocates and zero-initializes a block of memory.
 //
 //go:nosplit
 func FixedManualAllocatorCalloc(instance *FixedManualAllocator, sizeBytes, alignment uint64) unsafe.Pointer {
@@ -181,9 +152,8 @@ func FixedManualAllocatorCalloc(instance *FixedManualAllocator, sizeBytes, align
 	return ptr
 }
 
-// FixedManualAllocatorCallocUnsafe is similar to FixedManualAllocatorMallocUnsafe, except it also zeroes out the memory.
-// Note: This is quite expensive (especially for larger amounts of memory),
-// so avoid using it if at all possible.
+// FixedManualAllocatorCallocUnsafe is a faster version of Calloc that skips
+// alignment validation.
 //
 //go:nosplit
 func FixedManualAllocatorCallocUnsafe(instance *FixedManualAllocator, sizeBytes, alignment uint64) unsafe.Pointer {
@@ -192,8 +162,7 @@ func FixedManualAllocatorCallocUnsafe(instance *FixedManualAllocator, sizeBytes,
 	return ptr
 }
 
-// FixedManualAllocatorMallocObject is a convenience wrapper around FixedLinearAllocatorMalloc.
-// It converts the allocated memory to the desired object type.
+// FixedManualAllocatorMallocObject is a generic convenience wrapper around Malloc.
 //
 //go:nosplit
 func FixedManualAllocatorMallocObject[T any](instance *FixedManualAllocator) *T {
@@ -201,8 +170,7 @@ func FixedManualAllocatorMallocObject[T any](instance *FixedManualAllocator) *T 
 	return (*T)(ptr)
 }
 
-// FixedManualAllocatorCallocObject is a convenience wrapper around FixedLinearAllocatorCalloc.
-// It converts the allocated memory to the desired object type.
+// FixedManualAllocatorCallocObject is a generic convenience wrapper around Calloc.
 //
 //go:nosplit
 func FixedManualAllocatorCallocObject[T any](instance *FixedManualAllocator) *T {
@@ -210,130 +178,228 @@ func FixedManualAllocatorCallocObject[T any](instance *FixedManualAllocator) *T 
 	return (*T)(ptr)
 }
 
-// FixedManualAllocatorFree allows for the freeing of memory.
-// It panics if it does not know the pointer (which could be when double-freeing too)
+// FixedManualAllocatorFree releases a previously allocated block of memory, making it
+// available for future allocations.
+//
+// Panics if the pointer is not known to the allocator. Double-freeing or freeing
+// an invalid pointer results in undefined behavior.
 //
 //go:nosplit
 func FixedManualAllocatorFree(instance *FixedManualAllocator, ptr unsafe.Pointer) {
-	ptrAddr := uintptr(ptr)
+	ptrRef := fixedManualAllocatorFindRef(instance, ptr)
+	prevIdx, nextIdx := fixedManualAllocatorFindAdjacentRegions(instance, ptrRef)
 
-	refIdx, err := memcore.ArrayBinarySearch[ptrRecord](instance.ptrRefs, func(item ptrRecord) int8 {
-		if item.key < ptrAddr {
+	fixedManualAllocatorMergeOrInsert(instance, ptrRef, prevIdx, nextIdx)
+	primitives.FixedOrderedListDeleteUnsafe(instance.ptrRefs, fixedManualAllocatorFindRefIndex(instance, ptr))
+}
+
+// FixedManualAllocatorReset clears all allocations, making the entire memory region
+// available again. This is an O(1) operation that effectively defragments memory.
+// Pointers from before the reset are invalidated.
+func FixedManualAllocatorReset(instance *FixedManualAllocator) {
+	fixedManualAllocatorNotDestroyedGuarantee(instance)
+	FixedLinearAllocatorReset(instance.metadataAllocator)
+	primitives.FixedOrderedListClear(instance.freeMemory)
+	primitives.FixedOrderedListClear(instance.ptrRefs)
+	primitives.FixedOrderedListInsert(instance.freeMemory, freeMemoryRegionBlock{
+		memStartIdx: 0,
+		sizeBytes:   instance.cap,
+	})
+}
+
+// ---------------------------------- PRIVATE HELPERS ----------------------------------
+
+// updateFreeListAfterAllocation modifies the free list metadata to account for a new allocation.
+func updateFreeListAfterAllocation(instance *FixedManualAllocator, regionIdx uint, alignedIdx, sizeBytes, spaceBefore, spaceAfter uint64) {
+	switch {
+	case spaceBefore == 0 && spaceAfter == 0:
+		// Entire region consumed, remove it from the free list.
+		primitives.FixedOrderedListDeleteUnsafe(instance.freeMemory, uint64(regionIdx))
+
+	case spaceBefore == 0 && spaceAfter > 0:
+		// Allocation is at the start; shrink the region from the left.
+		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, uint64(regionIdx),
+			freeMemoryRegionBlock{
+				memStartIdx: alignedIdx + sizeBytes,
+				sizeBytes:   spaceAfter,
+			})
+
+	case spaceBefore > 0 && spaceAfter == 0:
+		// Allocation is at the end; shrink the region from the right.
+		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, uint64(regionIdx),
+			freeMemoryRegionBlock{
+				memStartIdx: alignedIdx - spaceBefore,
+				sizeBytes:   spaceBefore,
+			})
+
+	case spaceBefore > 0 && spaceAfter > 0:
+		// Allocation is in the middle; split the region into two.
+		// Replace the current region with the prefix.
+		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, uint64(regionIdx),
+			freeMemoryRegionBlock{
+				memStartIdx: alignedIdx - spaceBefore,
+				sizeBytes:   spaceBefore,
+			})
+		// Insert the new suffix region.
+		primitives.FixedOrderedListInsertAtUnsafe(instance.freeMemory, uint64(regionIdx+1),
+			freeMemoryRegionBlock{
+				memStartIdx: alignedIdx + sizeBytes,
+				sizeBytes:   spaceAfter,
+			})
+	}
+}
+
+// insertPtrRecord adds metadata for a new allocation to the pointer reference table.
+func insertPtrRecord(instance *FixedManualAllocator, ptr unsafe.Pointer, alignedIdx, sizeBytes uint64) {
+	newRecord := ptrRecord{key: uintptr(ptr), idx: alignedIdx, sizeBytes: sizeBytes}
+	// Find the correct sorted position for the new record.
+	insertionIdx := primitives.FixedOrderedListBinarySearchInsertionPoint(instance.ptrRefs, func(item ptrRecord) int8 {
+		if item.key < newRecord.key {
 			return -1
 		}
-		if item.key == ptrAddr {
-			return 0
-		}
-
 		return 1
 	})
-	if err != nil {
-		panic("cannot free, unknown pointer")
+	if err := primitives.FixedOrderedListInsertAt(instance.ptrRefs, insertionIdx, newRecord); err != nil {
+		panic("pointer reference table overflow or corruption")
 	}
+}
 
-	ptrRef := memcore.ArrayItemGetAtUnsafe(instance.ptrRefs, refIdx) // Unsafe is fine because we know for sure that the idx is valid.
+//go:nosplit
+//go:inline
+func fixedManualAllocatorFindRef(instance *FixedManualAllocator, ptr unsafe.Pointer) ptrRecord {
+	refIdx, err := primitives.FixedOrderedListBinarySearch(instance.ptrRefs, func(item ptrRecord) int8 {
+		addr := uintptr(ptr)
+		switch {
+		case item.key < addr:
+			return -1
+		case item.key == addr:
+			return 0
+		default:
+			return 1
+		}
+	})
+	if err != nil {
+		panic("cannot free: unknown pointer")
+	}
+	return primitives.FixedOrderedListItemGetAtUnsafe(instance.ptrRefs, refIdx)
+}
 
-	previousRegionMdIdx, nextRegionMdIdx := memcore.ArrayBinarySearchInterval(instance.freeMemory, func(item freeMemoryRegionBlock) int8 {
+//go:nosplit
+//go:inline
+func fixedManualAllocatorFindRefIndex(instance *FixedManualAllocator, ptr unsafe.Pointer) uint64 {
+	refIdx, err := primitives.FixedOrderedListBinarySearch(instance.ptrRefs, func(item ptrRecord) int8 {
+		addr := uintptr(ptr)
+		switch {
+		case item.key < addr:
+			return -1
+		case item.key == addr:
+			return 0
+		default:
+			return 1
+		}
+	})
+	if err != nil {
+		panic("cannot free: unknown pointer index")
+	}
+	return refIdx
+}
+
+//go:nosplit
+//go:inline
+func fixedManualAllocatorFindAdjacentRegions(instance *FixedManualAllocator, ptrRef ptrRecord) (uint64, uint64) {
+	return primitives.FixedOrderedListBinarySearchInterval(instance.freeMemory, func(item freeMemoryRegionBlock) int8 {
 		if item.memStartIdx < ptrRef.idx {
 			return -1
 		}
 		return 1
 	})
-
-	// At most we only have to merge two adjacent blocks of memory,
-	// Because of the splitting logic, a single free memory block can split into:
-	// 0, 1, or 2 other blocks of free memory, with ALWAYS a taken region of memory (unstored) in between.
-
-	// Cases:
-	// 1) Only the free region can be pushed in. -- freeMemregionsAmount += 1 => push
-	// 2) The free region and the previous region can be merged. -- freeMemregionsAmount does not change => swap
-	// 3) The free region the next region can be merged. -- freeMemregionsAmount does not change => swap
-	// 4) The free region and both the previous and next region can be merged. -- freeMemregionsAmount does not change => swap w/ previous, delete next with shift left beyond
-
-	previousRegionExists := memcore.ArrayIsIdxValid(instance.freeMemory, previousRegionMdIdx)
-	nextRegionExists := memcore.ArrayIsIdxValid(instance.freeMemory, nextRegionMdIdx)
-
-	if previousRegionExists {
-		previousRegion := memcore.ArrayItemGetAtUnsafe(instance.freeMemory, previousRegionMdIdx)
-		canMergePrevious := canMergeRegions(previousRegion.memStartIdx, previousRegion.sizeBytes, ptrRef.idx)
-
-		if nextRegionExists {
-			nextRegion := memcore.ArrayItemGetAtUnsafe(instance.freeMemory, nextRegionMdIdx)
-			canMergeNext := canMergeRegions(ptrRef.idx, ptrRef.sizeBytes, nextRegion.memStartIdx)
-
-			if canMergePrevious && canMergeNext {
-				swapPtrRegionAndRegion(instance, previousRegionMdIdx, previousRegion.memStartIdx, previousRegion.sizeBytes+ptrRef.sizeBytes+nextRegion.sizeBytes)
-				memcore.ArrayDeleteAndShiftAt(instance.freeMemory, nextRegionMdIdx) // Deleted nextRegionMdIdx and shifts all subsequent values left
-			} else if canMergePrevious {
-				swapPtrRegionAndRegion(instance, previousRegionMdIdx, previousRegion.memStartIdx, previousRegion.sizeBytes+ptrRef.sizeBytes)
-			} else if canMergeNext {
-				swapPtrRegionAndRegion(instance, nextRegionMdIdx, ptrRef.idx, ptrRef.sizeBytes+nextRegion.sizeBytes)
-			} else {
-				pushFreePointer(instance, ptrRef, nextRegionMdIdx)
-			}
-		} else {
-			if canMergePrevious {
-				swapPtrRegionAndRegion(instance, previousRegionMdIdx, previousRegion.memStartIdx, previousRegion.sizeBytes+ptrRef.sizeBytes)
-			} else {
-				pushFreePointer(instance, ptrRef, previousRegionMdIdx)
-			}
-		}
-	} else if nextRegionExists {
-		nextRegion := memcore.ArrayItemGetAtUnsafe(instance.freeMemory, nextRegionMdIdx)
-
-		if canMergeRegions(ptrRef.idx, ptrRef.sizeBytes, nextRegion.memStartIdx) {
-			swapPtrRegionAndRegion(instance, nextRegionMdIdx, ptrRef.idx, ptrRef.sizeBytes+nextRegion.sizeBytes)
-		} else {
-			pushFreePointer(instance, ptrRef, nextRegionMdIdx)
-		}
-
-	} // Don't have to check for neither exist because the binary interval search always returns valid indices.
-
-	memcore.ArrayDeleteAtUnsafe(instance.ptrRefs, refIdx)
 }
 
-// FixedManualAllocatorReset sets the index of the allocator to 0, allowing the memory to be re-used.
-// Using pointers created before resetting results in undefined behaviour.
-// This automatically "defragments" the memory.
-func FixedManualAllocatorReset(instance *FixedManualAllocator) {
-	fixedManualAllocatorNotDestroyedGuarantee(instance)
-	FixedLinearAllocatorReset(instance.metadataAllocator)
-	memcore.ArrayClear(instance.freeMemory)
-	memcore.ArrayClear(instance.ptrRefs)
+//go:nosplit
+func fixedManualAllocatorMergeOrInsert(instance *FixedManualAllocator, ptrRef ptrRecord, prevIdx, nextIdx uint64) {
+	hasPrev := primitives.FixedOrderedListIsIdxValid(instance.freeMemory, prevIdx)
+	hasNext := primitives.FixedOrderedListIsIdxValid(instance.freeMemory, nextIdx)
 
-	memcore.ArraySetAt(instance.freeMemory, 0, freeMemoryRegionBlock{
-		memStartIdx: 0,
-		sizeBytes:   instance.cap,
-	})
-	instance.freeMemoryRegionsAmount = 1
-	instance.ptrRefAmount = 0
+	switch {
+	case hasPrev && hasNext:
+		fixedManualAllocatorMergePrevNext(instance, ptrRef, prevIdx, nextIdx)
+	case hasPrev:
+		fixedManualAllocatorMergePrev(instance, ptrRef, prevIdx, nextIdx)
+	case hasNext:
+		fixedManualAllocatorMergeNext(instance, ptrRef, nextIdx)
+	default:
+		pushFreePointer(instance, ptrRef, nextIdx)
+	}
 }
-
-// ---------------------------------- PRIVATE HELPERS
 
 //go:nosplit
 //go:inline
-func swapPtrRegionAndRegion(instance *FixedManualAllocator, mdIdx, memIdx, memSize uint64) {
+func fixedManualAllocatorMergePrevNext(instance *FixedManualAllocator, ptrRef ptrRecord, prevIdx, nextIdx uint64) {
+	prev := primitives.FixedOrderedListItemGetAtUnsafe(instance.freeMemory, prevIdx)
+	next := primitives.FixedOrderedListItemGetAtUnsafe(instance.freeMemory, nextIdx)
+
+	canMergePrev := canMergeRegions(prev.memStartIdx, prev.sizeBytes, ptrRef.idx)
+	canMergeNext := canMergeRegions(ptrRef.idx, ptrRef.sizeBytes, next.memStartIdx)
+
+	switch {
+	case canMergePrev && canMergeNext:
+		// Merge all three: prev + freed block + next
+		size := prev.sizeBytes + ptrRef.sizeBytes + next.sizeBytes
+		updateFreeRegion(instance, prevIdx, prev.memStartIdx, size)
+		primitives.FixedOrderedListDelete(instance.freeMemory, nextIdx)
+	case canMergePrev:
+		fixedManualAllocatorMergePrev(instance, ptrRef, prevIdx, nextIdx)
+	case canMergeNext:
+		fixedManualAllocatorMergeNext(instance, ptrRef, nextIdx)
+	default:
+		pushFreePointer(instance, ptrRef, nextIdx)
+	}
+}
+
+//go:nosplit
+//go:inline
+func fixedManualAllocatorMergePrev(instance *FixedManualAllocator, ptrRef ptrRecord, prevIdx, nextIdx uint64) {
+	prev := primitives.FixedOrderedListItemGetAtUnsafe(instance.freeMemory, prevIdx)
+	if !canMergeRegions(prev.memStartIdx, prev.sizeBytes, ptrRef.idx) {
+		pushFreePointer(instance, ptrRef, nextIdx)
+		return
+	}
+	size := prev.sizeBytes + ptrRef.sizeBytes
+	updateFreeRegion(instance, prevIdx, prev.memStartIdx, size)
+}
+
+//go:nosplit
+//go:inline
+func fixedManualAllocatorMergeNext(instance *FixedManualAllocator, ptrRef ptrRecord, nextIdx uint64) {
+	next := primitives.FixedOrderedListItemGetAtUnsafe(instance.freeMemory, nextIdx)
+	if !canMergeRegions(ptrRef.idx, ptrRef.sizeBytes, next.memStartIdx) {
+		pushFreePointer(instance, ptrRef, nextIdx)
+		return
+	}
+	size := ptrRef.sizeBytes + next.sizeBytes
+	updateFreeRegion(instance, nextIdx, ptrRef.idx, size)
+}
+
+//go:nosplit
+//go:inline
+func updateFreeRegion(instance *FixedManualAllocator, mdIdx, memIdx, memSize uint64) {
 	newFreeRegion := freeMemoryRegionBlock{
-		memStartIdx: memIdx,
+		memStartIdx: sanityCheckIdx(instance, memIdx),
 		sizeBytes:   memSize,
 	}
-	memcore.ArraySetAtUnsafe(instance.freeMemory, mdIdx, newFreeRegion) // Swap - free memory region amount stays same
+	primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, mdIdx, newFreeRegion)
 }
 
 //go:nosplit
 //go:inline
 func pushFreePointer(instance *FixedManualAllocator, ptrRef ptrRecord, mdIdx uint64) {
 	newFreeRegion := freeMemoryRegionBlock{
-		memStartIdx: ptrRef.idx,
+		memStartIdx: sanityCheckIdx(instance, ptrRef.idx),
 		sizeBytes:   ptrRef.sizeBytes,
 	}
-
-	err := memcore.ArrayInsertAt(instance.freeMemory, mdIdx, newFreeRegion)
-	if err != nil { // Insert shifts original idx and subsequents one slot to the right.
-		panic("cannot push new region because there is no more metadata space") // This should technically not happen but just in case.
+	if err := primitives.FixedOrderedListInsertAt(instance.freeMemory, mdIdx, newFreeRegion); err != nil {
+		panic("cannot push new free region: metadata capacity exceeded")
 	}
-	instance.freeMemoryRegionsAmount++
 }
 
 //go:nosplit
@@ -344,44 +410,30 @@ func canMergeRegions(aIdx, aSize, bIdx uint64) bool {
 
 //go:nosplit
 //go:inline
-func getFreeAlignedIdx(allocator *FixedManualAllocator, requestedSize uint64, requestedAlignment uint64) (uint, uint64, uint64, uint64, error) {
-	for i := uint(0); i < allocator.freeMemoryRegionsAmount; i++ {
-		region, err := memcore.ArrayItemGetAt(allocator.freeMemory, (uint64)(i))
+func getFreeAlignedIdx(allocator *FixedManualAllocator, requestedSize, requestedAlignment uint64) (uint, uint64, uint64, uint64, error) {
+	for i := uint(0); i < uint(primitives.FixedOrderedListLengthGet(allocator.freeMemory)); i++ {
+		region, err := primitives.FixedOrderedListItemGetAt(allocator.freeMemory, uint64(i))
 		if err != nil {
-			return 0, 0, 0, 0, err
+			return 0, 0, 0, 0, err // Should not happen in a loop from 0 to len-1
 		}
 
 		regionAlignedIdx := alignIdxUp(region.memStartIdx, requestedAlignment)
-		leftOverSpaceBefore := regionAlignedIdx - region.memStartIdx
-
-		if leftOverSpaceBefore > region.sizeBytes {
-			continue // alignment pushes beyond this region completely
+		if regionAlignedIdx < region.memStartIdx { // Check for overflow
+			continue
 		}
 
-		adjustedSize := region.sizeBytes - leftOverSpaceBefore
+		spaceBefore := regionAlignedIdx - region.memStartIdx
+		if spaceBefore > region.sizeBytes { // Not enough space even for alignment
+			continue
+		}
 
+		adjustedSize := region.sizeBytes - spaceBefore
 		if adjustedSize >= requestedSize {
-			leftOverSpaceAfter := adjustedSize - requestedSize
-
-			return i, regionAlignedIdx, leftOverSpaceBefore, leftOverSpaceAfter, nil
+			spaceAfter := adjustedSize - requestedSize
+			return i, regionAlignedIdx, spaceBefore, spaceAfter, nil
 		}
 	}
-
-	return 0, 0, 0, 0, fmt.Errorf("no region free that satisfied requested size %v and requested alignment %v", requestedSize, requestedAlignment)
-}
-
-type ptrRefTable *memcore.Array[ptrRecord]
-type memoryFreeRegions *memcore.Array[freeMemoryRegionBlock]
-
-type freeMemoryRegionBlock struct {
-	memStartIdx uint64
-	sizeBytes   uint64
-}
-
-type ptrRecord struct {
-	key       uintptr
-	idx       uint64
-	sizeBytes uint64
+	return 0, 0, 0, 0, fmt.Errorf("no suitable free region found for size %d and alignment %d", requestedSize, requestedAlignment)
 }
 
 //go:inline
@@ -389,4 +441,30 @@ func fixedManualAllocatorNotDestroyedGuarantee(instance *FixedManualAllocator) {
 	if instance.destroyed {
 		panic("cannot use a destroyed allocator")
 	}
+}
+
+//go:inline
+func sanityCheckIdx(instance *FixedManualAllocator, idx uint64) uint64 {
+	if idx > instance.cap {
+		panic("allocator metadata corruption: absolute address stored in relative index field")
+	}
+	return idx
+}
+
+// ---------------------------------- TYPE DEFINITIONS ----------------------------------
+
+type ptrRefTable *primitives.FixedOrderedList[ptrRecord]
+type memoryFreeRegions *primitives.FixedOrderedList[freeMemoryRegionBlock]
+
+// freeMemoryRegionBlock represents a contiguous region of unallocated memory.
+type freeMemoryRegionBlock struct {
+	memStartIdx uint64 // Byte index of the region start
+	sizeBytes   uint64 // Total size in bytes
+}
+
+// ptrRecord tracks allocated pointer metadata.
+type ptrRecord struct {
+	key       uintptr // Address of the allocation (used for searching)
+	idx       uint64  // Byte index inside allocator.storage
+	sizeBytes uint64  // Size of allocation in bytes
 }

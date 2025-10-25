@@ -28,6 +28,16 @@ type DynamicLinearAllocator struct {
 }
 
 // DynamicLinearAllocatorCreate creates a new Dynamic Allocator instance with X initial capacity.
+//
+// ⚠️ Important: Do NOT allocate this struct itself inside manually-managed memory.
+// The struct contains Go pointers and must remain
+// visible to the Go garbage collector.
+//
+// You may, however, point its internal data (the `ptr` field) to memory that was
+// manually allocated (e.g. via mmap or a custom allocator). In other words:
+//
+//	✅ Safe:   header on Go heap, data in manual memory
+//	❌ Unsafe: header and data both in manual memory
 func DynamicLinearAllocatorCreate(initialCapacityBytes uint, growthStrategy GrowthStrategy) *DynamicLinearAllocator {
 	mmap, err := memcore.MemmapRequest((int)(initialCapacityBytes), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
 
