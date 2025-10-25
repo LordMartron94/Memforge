@@ -45,7 +45,25 @@ func FixedManualAllocatorCreate(sizeBytes uint) *FixedManualAllocator {
 	}
 
 	// --- Metadata Arena ---
-	metadataAllocationSize := max(64*1024, sizeBytes/128)
+
+	// This is the robust heuristic. It calculates the absolute maximum number of
+	// allocations possible and provisions metadata space for that worst-case scenario.
+	minTrackableAllocSize := memcore.SizeOf[uintptr]()
+
+	if uint64(sizeBytes) < minTrackableAllocSize {
+		sizeBytes = uint(minTrackableAllocSize)
+	}
+
+	maxPossibleAllocs := uint64(sizeBytes) / minTrackableAllocSize
+
+	// Calculate the exact space needed for the pointer reference table in the worst case.
+	requiredPtrRefBytes := maxPossibleAllocs * memcore.SizeOf[ptrRecord]()
+
+	// Double the space to safely accommodate the free list metadata as well.
+	// We also enforce a minimum metadata size (e.g., 64KB) for very small allocators
+	// to ensure they remain functional.
+	metadataAllocationSize := max(64*1024, requiredPtrRefBytes*2)
+
 	metadataAllocator := FixedLinearAllocatorCreate(int(metadataAllocationSize))
 
 	// --- Split Metadata ---
