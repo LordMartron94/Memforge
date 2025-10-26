@@ -45,9 +45,6 @@ func FixedManualAllocatorCreate(sizeBytes uint) *FixedManualAllocator {
 	}
 
 	// --- Metadata Arena ---
-
-	// This is the robust heuristic. It calculates the absolute maximum number of
-	// allocations possible and provisions metadata space for that worst-case scenario.
 	minTrackableAllocSize := memcore.SizeOf[uintptr]()
 
 	if uint64(sizeBytes) < minTrackableAllocSize {
@@ -402,7 +399,7 @@ func fixedManualAllocatorMergeNext(instance *FixedManualAllocator, ptrRef ptrRec
 //go:inline
 func updateFreeRegion(instance *FixedManualAllocator, mdIdx, memIdx, memSize uint64) {
 	newFreeRegion := freeMemoryRegionBlock{
-		memStartIdx: sanityCheckIdx(instance, memIdx),
+		memStartIdx: memIdx,
 		sizeBytes:   memSize,
 	}
 	primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, mdIdx, newFreeRegion)
@@ -412,7 +409,7 @@ func updateFreeRegion(instance *FixedManualAllocator, mdIdx, memIdx, memSize uin
 //go:inline
 func pushFreePointer(instance *FixedManualAllocator, ptrRef ptrRecord, mdIdx uint64) {
 	newFreeRegion := freeMemoryRegionBlock{
-		memStartIdx: sanityCheckIdx(instance, ptrRef.idx),
+		memStartIdx: ptrRef.idx,
 		sizeBytes:   ptrRef.sizeBytes,
 	}
 	if err := primitives.FixedOrderedListInsertAt(instance.freeMemory, mdIdx, newFreeRegion); err != nil {
@@ -430,10 +427,7 @@ func canMergeRegions(aIdx, aSize, bIdx uint64) bool {
 //go:inline
 func getFreeAlignedIdx(allocator *FixedManualAllocator, requestedSize, requestedAlignment uint64) (uint, uint64, uint64, uint64, error) {
 	for i := uint(0); i < uint(primitives.FixedOrderedListLengthGet(allocator.freeMemory)); i++ {
-		region, err := primitives.FixedOrderedListItemGetAt(allocator.freeMemory, uint64(i))
-		if err != nil {
-			return 0, 0, 0, 0, err // Should not happen in a loop from 0 to len-1
-		}
+		region := primitives.FixedOrderedListItemGetAtUnsafe(allocator.freeMemory, uint64(i))
 
 		regionAlignedIdx := alignIdxUp(region.memStartIdx, requestedAlignment)
 		if regionAlignedIdx < region.memStartIdx { // Check for overflow
@@ -459,14 +453,6 @@ func fixedManualAllocatorNotDestroyedGuarantee(instance *FixedManualAllocator) {
 	if instance.destroyed {
 		panic("cannot use a destroyed allocator")
 	}
-}
-
-//go:inline
-func sanityCheckIdx(instance *FixedManualAllocator, idx uint64) uint64 {
-	if idx > instance.cap {
-		panic("allocator metadata corruption: absolute address stored in relative index field")
-	}
-	return idx
 }
 
 // ---------------------------------- TYPE DEFINITIONS ----------------------------------
