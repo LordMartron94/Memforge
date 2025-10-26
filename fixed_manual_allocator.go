@@ -7,6 +7,8 @@ import (
 	"unsafe"
 )
 
+const allocatorFailureCountResetHeuristic uint8 = 5
+
 // FixedManualAllocator is a fixed-size allocator that allows for manual freeing of memory.
 // It is designed for high performance by avoiding locks and runtime overhead.
 //
@@ -22,8 +24,10 @@ type FixedManualAllocator struct {
 	freeMemory memoryFreeRegions
 	ptrRefs    ptrRefTable
 
-	cap       uint64
-	destroyed bool
+	cap                   uint64
+	destroyed             bool
+	regionIdxAreaHint     uint64
+	regionIdxFailureCount uint8
 }
 
 // FixedManualAllocatorCreate initializes a new manual allocator with a given size.
@@ -92,12 +96,14 @@ func FixedManualAllocatorCreate(sizeBytes uint) *FixedManualAllocator {
 	})
 
 	return &FixedManualAllocator{
-		storage:           mmap,
-		metadataAllocator: metadataAllocator,
-		cap:               uint64(sizeBytes),
-		ptrRefs:           ptrRefs,
-		freeMemory:        freeMemory,
-		destroyed:         false,
+		storage:               mmap,
+		metadataAllocator:     metadataAllocator,
+		cap:                   uint64(sizeBytes),
+		ptrRefs:               ptrRefs,
+		freeMemory:            freeMemory,
+		destroyed:             false,
+		regionIdxAreaHint:     0,
+		regionIdxFailureCount: 0,
 	}
 }
 
@@ -220,20 +226,24 @@ func FixedManualAllocatorReset(instance *FixedManualAllocator) {
 		memStartIdx: 0,
 		sizeBytes:   instance.cap,
 	})
+	instance.regionIdxAreaHint = 0
 }
 
 // ---------------------------------- PRIVATE HELPERS ----------------------------------
 
 // updateFreeListAfterAllocation modifies the free list metadata to account for a new allocation.
-func updateFreeListAfterAllocation(instance *FixedManualAllocator, regionIdx uint, alignedIdx, sizeBytes, spaceBefore, spaceAfter uint64) {
+func updateFreeListAfterAllocation(instance *FixedManualAllocator, regionIdx uint64, alignedIdx, sizeBytes, spaceBefore, spaceAfter uint64) {
 	switch {
 	case spaceBefore == 0 && spaceAfter == 0:
 		// Entire region consumed, remove it from the free list.
-		primitives.FixedOrderedListDeleteUnsafe(instance.freeMemory, uint64(regionIdx))
+		primitives.FixedOrderedListDeleteUnsafe(instance.freeMemory, regionIdx)
+		if instance.regionIdxAreaHint > regionIdx && instance.regionIdxAreaHint != 0 {
+			instance.regionIdxAreaHint--
+		}
 
 	case spaceBefore == 0 && spaceAfter > 0:
 		// Allocation is at the start; shrink the region from the left.
-		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, uint64(regionIdx),
+		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, regionIdx,
 			freeMemoryRegionBlock{
 				memStartIdx: alignedIdx + sizeBytes,
 				sizeBytes:   spaceAfter,
@@ -241,7 +251,7 @@ func updateFreeListAfterAllocation(instance *FixedManualAllocator, regionIdx uin
 
 	case spaceBefore > 0 && spaceAfter == 0:
 		// Allocation is at the end; shrink the region from the right.
-		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, uint64(regionIdx),
+		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, regionIdx,
 			freeMemoryRegionBlock{
 				memStartIdx: alignedIdx - spaceBefore,
 				sizeBytes:   spaceBefore,
@@ -250,17 +260,21 @@ func updateFreeListAfterAllocation(instance *FixedManualAllocator, regionIdx uin
 	case spaceBefore > 0 && spaceAfter > 0:
 		// Allocation is in the middle; split the region into two.
 		// Replace the current region with the prefix.
-		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, uint64(regionIdx),
+		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, regionIdx,
 			freeMemoryRegionBlock{
 				memStartIdx: alignedIdx - spaceBefore,
 				sizeBytes:   spaceBefore,
 			})
 		// Insert the new suffix region.
-		primitives.FixedOrderedListInsertAtUnsafe(instance.freeMemory, uint64(regionIdx+1),
+		primitives.FixedOrderedListInsertAtUnsafe(instance.freeMemory, regionIdx+1,
 			freeMemoryRegionBlock{
 				memStartIdx: alignedIdx + sizeBytes,
 				sizeBytes:   spaceAfter,
 			})
+
+		if regionIdx < instance.regionIdxAreaHint {
+			instance.regionIdxAreaHint++ // since list shifted right
+		}
 	}
 }
 
@@ -403,6 +417,10 @@ func updateFreeRegion(instance *FixedManualAllocator, mdIdx, memIdx, memSize uin
 		sizeBytes:   memSize,
 	}
 	primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, mdIdx, newFreeRegion)
+
+	if mdIdx < instance.regionIdxAreaHint {
+		instance.regionIdxAreaHint = mdIdx
+	}
 }
 
 //go:nosplit
@@ -415,6 +433,10 @@ func pushFreePointer(instance *FixedManualAllocator, ptrRef ptrRecord, mdIdx uin
 	if err := primitives.FixedOrderedListInsertAt(instance.freeMemory, mdIdx, newFreeRegion); err != nil {
 		panic("cannot push new free region: metadata capacity exceeded")
 	}
+
+	if mdIdx < instance.regionIdxAreaHint {
+		instance.regionIdxAreaHint = mdIdx
+	}
 }
 
 //go:nosplit
@@ -425,8 +447,35 @@ func canMergeRegions(aIdx, aSize, bIdx uint64) bool {
 
 //go:nosplit
 //go:inline
-func getFreeAlignedIdx(allocator *FixedManualAllocator, requestedSize, requestedAlignment uint64) (uint, uint64, uint64, uint64, error) {
-	for i := uint(0); i < uint(primitives.FixedOrderedListLengthGet(allocator.freeMemory)); i++ {
+func getFreeAlignedIdx(allocator *FixedManualAllocator, requestedSize, requestedAlignment uint64) (uint64, uint64, uint64, uint64, error) {
+	regionAmount := primitives.FixedOrderedListLengthGet(allocator.freeMemory)
+
+	idx, regionAlignedIdx, spaceBefore, spaceAfter, err := freeAlignedIdxLoop(
+		allocator.regionIdxAreaHint, regionAmount,
+		allocator, requestedSize, requestedAlignment)
+	if err == nil {
+		return idx, regionAlignedIdx, spaceBefore, spaceAfter, nil
+	}
+
+	allocator.regionIdxFailureCount++
+
+	if allocator.regionIdxFailureCount > allocatorFailureCountResetHeuristic {
+		allocator.regionIdxFailureCount = 0
+		allocator.regionIdxAreaHint = 0
+	}
+
+	start := uint64(0)
+	end := allocator.regionIdxAreaHint
+	if end > regionAmount {
+		end = regionAmount
+	}
+	return freeAlignedIdxLoop(start, end, allocator, requestedSize, requestedAlignment)
+}
+
+//go:nosplit
+//go:inline
+func freeAlignedIdxLoop(startIdx, lastIdxExclusive uint64, allocator *FixedManualAllocator, requestedSize, requestedAlignment uint64) (uint64, uint64, uint64, uint64, error) {
+	for i := startIdx; i < lastIdxExclusive; i++ {
 		region := primitives.FixedOrderedListItemGetAtUnsafe(allocator.freeMemory, uint64(i))
 
 		regionAlignedIdx := alignIdxUp(region.memStartIdx, requestedAlignment)
@@ -442,9 +491,12 @@ func getFreeAlignedIdx(allocator *FixedManualAllocator, requestedSize, requested
 		adjustedSize := region.sizeBytes - spaceBefore
 		if adjustedSize >= requestedSize {
 			spaceAfter := adjustedSize - requestedSize
+			allocator.regionIdxAreaHint = i
+			allocator.regionIdxFailureCount = 0
 			return i, regionAlignedIdx, spaceBefore, spaceAfter, nil
 		}
 	}
+
 	return 0, 0, 0, 0, fmt.Errorf("no suitable free region found for size %d and alignment %d", requestedSize, requestedAlignment)
 }
 
