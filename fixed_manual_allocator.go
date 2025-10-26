@@ -269,7 +269,7 @@ func insertPtrRecord(instance *FixedManualAllocator, ptr unsafe.Pointer, aligned
 	newRecord := ptrRecord{key: uintptr(ptr), idx: alignedIdx, sizeBytes: sizeBytes}
 	// Find the correct sorted position for the new record.
 	insertionIdx := primitives.FixedOrderedListBinarySearchInsertionPoint(instance.ptrRefs, func(item ptrRecord) int8 {
-		if item.key < newRecord.key {
+		if item.idx < newRecord.idx {
 			return -1
 		}
 		return 1
