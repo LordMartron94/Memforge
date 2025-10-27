@@ -53,44 +53,46 @@ func FixedManualAllocatorCreate(sizeBytes uint) *FixedManualAllocator {
 	if uint64(sizeBytes) < minTrackableAllocSize {
 		sizeBytes = uint(minTrackableAllocSize)
 	}
-
 	maxPossibleAllocs := uint64(sizeBytes) / minTrackableAllocSize
 
-	// Compute metadata sizes
-	ptrRefBytes := primitives.ContainerRequiredBytes[ptrRecord](maxPossibleAllocs)
-	freeListBytes := primitives.ContainerRequiredBytes[freeMemoryRegionBlock](maxPossibleAllocs)
+	// --- Compute metadata sizes ---
+	ptrRefBytes := primitives.FixedOrderedListRequiredBytes[ptrRecord](maxPossibleAllocs)
+	freeListBytes := primitives.FixedOrderedListRequiredBytes[freeMemoryRegionBlock](maxPossibleAllocs)
+	ptrAlign := memcore.AlignOf[ptrRecord]()
+	freeAlign := memcore.AlignOf[freeMemoryRegionBlock]()
 
-	// Combine and clamp
-	metadataAllocationSize := max(64*1024, ptrRefBytes+freeListBytes)
+	// --- Create a single metadata allocator ---
+	totalMetadataBytes := ptrRefBytes + freeListBytes + 4*1024 // small padding margin
+	metadataAllocationSize := max(64*1024, totalMetadataBytes)
 	metadataAllocator := FixedLinearAllocatorCreate(int(metadataAllocationSize))
 
-	// Allocate metadata regions
+	// --- Allocate each metadata table separately ---
 	ptrRefsTableAddr := FixedLinearAllocatorMalloc(
 		metadataAllocator,
 		ptrRefBytes,
-		memcore.AlignOf[ptrRecord](),
+		ptrAlign,
 	)
 	freeMemoryAddr := FixedLinearAllocatorMalloc(
 		metadataAllocator,
 		freeListBytes,
-		memcore.AlignOf[freeMemoryRegionBlock](),
+		freeAlign,
 	)
 
-	ptrRefCapacity := ptrRefBytes / memcore.SizeOf[ptrRecord]()
-	freeMemCapacity := freeListBytes / memcore.SizeOf[freeMemoryRegionBlock]()
-
+	// --- Initialize metadata containers ---
 	ptrRefs := ptrRefTable(
-		primitives.FixedOrderedListCreateAt[ptrRecord](ptrRefsTableAddr, ptrRefCapacity),
+		primitives.FixedOrderedListCreateAt[ptrRecord](ptrRefsTableAddr, maxPossibleAllocs),
 	)
 	freeMemory := memoryFreeRegions(
-		primitives.FixedOrderedListCreateAt[freeMemoryRegionBlock](freeMemoryAddr, freeMemCapacity),
+		primitives.FixedOrderedListCreateAt[freeMemoryRegionBlock](freeMemoryAddr, maxPossibleAllocs),
 	)
 
-	primitives.FixedOrderedListInsert(freeMemory, freeMemoryRegionBlock{
+	// --- Initialize first free region ---
+	primitives.FixedOrderedListAppendUnsafe(freeMemory, freeMemoryRegionBlock{
 		memStartIdx: 0,
 		sizeBytes:   uint64(sizeBytes),
 	})
 
+	// --- Finalize allocator ---
 	return &FixedManualAllocator{
 		storage:               mmap,
 		metadataAllocator:     metadataAllocator,
@@ -218,7 +220,7 @@ func FixedManualAllocatorReset(instance *FixedManualAllocator) {
 	FixedLinearAllocatorReset(instance.metadataAllocator)
 	primitives.FixedOrderedListClear(instance.freeMemory)
 	primitives.FixedOrderedListClear(instance.ptrRefs)
-	primitives.FixedOrderedListInsert(instance.freeMemory, freeMemoryRegionBlock{
+	primitives.FixedOrderedListAppend(instance.freeMemory, freeMemoryRegionBlock{
 		memStartIdx: 0,
 		sizeBytes:   instance.cap,
 	})
