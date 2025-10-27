@@ -50,37 +50,34 @@ func FixedManualAllocatorCreate(sizeBytes uint) *FixedManualAllocator {
 
 	// --- Metadata Arena ---
 	minTrackableAllocSize := memcore.SizeOf[uintptr]()
-
 	if uint64(sizeBytes) < minTrackableAllocSize {
 		sizeBytes = uint(minTrackableAllocSize)
 	}
 
 	maxPossibleAllocs := uint64(sizeBytes) / minTrackableAllocSize
 
-	// Calculate the exact space needed for the pointer reference table in the worst case.
-	requiredPtrRefBytes := maxPossibleAllocs * memcore.SizeOf[ptrRecord]()
+	// Compute metadata sizes
+	ptrRefBytes := primitives.ContainerRequiredBytes[ptrRecord](maxPossibleAllocs)
+	freeListBytes := primitives.ContainerRequiredBytes[freeMemoryRegionBlock](maxPossibleAllocs)
 
-	// Double the space to safely accommodate the free list metadata as well.
-	// We also enforce a minimum metadata size (e.g., 64KB) for very small allocators
-	// to ensure they remain functional.
-	metadataAllocationSize := max(64*1024, requiredPtrRefBytes*2)
-
+	// Combine and clamp
+	metadataAllocationSize := max(64*1024, ptrRefBytes+freeListBytes)
 	metadataAllocator := FixedLinearAllocatorCreate(int(metadataAllocationSize))
 
-	// --- Split Metadata ---
+	// Allocate metadata regions
 	ptrRefsTableAddr := FixedLinearAllocatorMalloc(
 		metadataAllocator,
-		uint64(metadataAllocationSize/2),
+		ptrRefBytes,
 		memcore.AlignOf[ptrRecord](),
 	)
 	freeMemoryAddr := FixedLinearAllocatorMalloc(
 		metadataAllocator,
-		uint64(metadataAllocationSize/2),
+		freeListBytes,
 		memcore.AlignOf[freeMemoryRegionBlock](),
 	)
 
-	ptrRefCapacity := uint64(metadataAllocationSize/2) / memcore.SizeOf[ptrRecord]()
-	freeMemCapacity := uint64(metadataAllocationSize/2) / memcore.SizeOf[freeMemoryRegionBlock]()
+	ptrRefCapacity := ptrRefBytes / memcore.SizeOf[ptrRecord]()
+	freeMemCapacity := freeListBytes / memcore.SizeOf[freeMemoryRegionBlock]()
 
 	ptrRefs := ptrRefTable(
 		primitives.FixedOrderedListCreateAt[ptrRecord](ptrRefsTableAddr, ptrRefCapacity),
@@ -89,7 +86,6 @@ func FixedManualAllocatorCreate(sizeBytes uint) *FixedManualAllocator {
 		primitives.FixedOrderedListCreateAt[freeMemoryRegionBlock](freeMemoryAddr, freeMemCapacity),
 	)
 
-	// Initialize with a single block representing all available memory.
 	primitives.FixedOrderedListInsert(freeMemory, freeMemoryRegionBlock{
 		memStartIdx: 0,
 		sizeBytes:   uint64(sizeBytes),
@@ -207,11 +203,11 @@ func FixedManualAllocatorCallocObject[T any](instance *FixedManualAllocator) *T 
 //
 //go:nosplit
 func FixedManualAllocatorFree(instance *FixedManualAllocator, ptr unsafe.Pointer) {
-	ptrRef := fixedManualAllocatorFindRef(instance, ptr)
+	ptrRef, refIdx := fixedManualAllocatorFindRef(instance, ptr)
 	prevIdx, nextIdx := fixedManualAllocatorFindAdjacentRegions(instance, ptrRef)
 
 	fixedManualAllocatorMergeOrInsert(instance, ptrRef, prevIdx, nextIdx)
-	primitives.FixedOrderedListDeleteUnsafe(instance.ptrRefs, fixedManualAllocatorFindRefIndex(instance, ptr))
+	primitives.FixedOrderedListDeleteUnsafe(instance.ptrRefs, refIdx)
 }
 
 // FixedManualAllocatorReset clears all allocations, making the entire memory region
@@ -295,7 +291,7 @@ func insertPtrRecord(instance *FixedManualAllocator, ptr unsafe.Pointer, aligned
 
 //go:nosplit
 //go:inline
-func fixedManualAllocatorFindRef(instance *FixedManualAllocator, ptr unsafe.Pointer) ptrRecord {
+func fixedManualAllocatorFindRef(instance *FixedManualAllocator, ptr unsafe.Pointer) (ptrRecord, uint64) {
 	refIdx, err := primitives.FixedOrderedListBinarySearch(instance.ptrRefs, func(item ptrRecord) int8 {
 		addr := uintptr(ptr)
 		switch {
@@ -310,27 +306,7 @@ func fixedManualAllocatorFindRef(instance *FixedManualAllocator, ptr unsafe.Poin
 	if err != nil {
 		panic("cannot free: unknown pointer")
 	}
-	return primitives.FixedOrderedListItemGetAtUnsafe(instance.ptrRefs, refIdx)
-}
-
-//go:nosplit
-//go:inline
-func fixedManualAllocatorFindRefIndex(instance *FixedManualAllocator, ptr unsafe.Pointer) uint64 {
-	refIdx, err := primitives.FixedOrderedListBinarySearch(instance.ptrRefs, func(item ptrRecord) int8 {
-		addr := uintptr(ptr)
-		switch {
-		case item.key < addr:
-			return -1
-		case item.key == addr:
-			return 0
-		default:
-			return 1
-		}
-	})
-	if err != nil {
-		panic("cannot free: unknown pointer index")
-	}
-	return refIdx
+	return primitives.FixedOrderedListItemGetAtUnsafe(instance.ptrRefs, refIdx), refIdx
 }
 
 //go:nosplit
