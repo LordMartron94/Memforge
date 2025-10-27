@@ -239,28 +239,23 @@ func updateFreeListAfterAllocation(instance *FixedManualAllocator, regionIdx uin
 
 	case spaceBefore == 0 && spaceAfter > 0:
 		// Allocation is at the start; shrink the region from the left.
-		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, regionIdx,
-			freeMemoryRegionBlock{
-				memStartIdx: alignedIdx + sizeBytes,
-				sizeBytes:   spaceAfter,
-			})
+		ptr := primitives.FixedOrderedListItemPtrGetAtUnsafe(instance.freeMemory, regionIdx)
+		ptr.memStartIdx = alignedIdx + sizeBytes
+		ptr.sizeBytes = spaceAfter
 
 	case spaceBefore > 0 && spaceAfter == 0:
 		// Allocation is at the end; shrink the region from the right.
-		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, regionIdx,
-			freeMemoryRegionBlock{
-				memStartIdx: alignedIdx - spaceBefore,
-				sizeBytes:   spaceBefore,
-			})
+		ptr := primitives.FixedOrderedListItemPtrGetAtUnsafe(instance.freeMemory, regionIdx)
+		ptr.memStartIdx = alignedIdx - spaceBefore
+		ptr.sizeBytes = spaceBefore
 
 	case spaceBefore > 0 && spaceAfter > 0:
 		// Allocation is in the middle; split the region into two.
 		// Replace the current region with the prefix.
-		primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, regionIdx,
-			freeMemoryRegionBlock{
-				memStartIdx: alignedIdx - spaceBefore,
-				sizeBytes:   spaceBefore,
-			})
+		ptr := primitives.FixedOrderedListItemPtrGetAtUnsafe(instance.freeMemory, regionIdx)
+		ptr.memStartIdx = alignedIdx - spaceBefore
+		ptr.sizeBytes = spaceBefore
+
 		// Insert the new suffix region.
 		primitives.FixedOrderedListInsertAtUnsafe(instance.freeMemory, regionIdx+1,
 			freeMemoryRegionBlock{
@@ -291,7 +286,7 @@ func insertPtrRecord(instance *FixedManualAllocator, ptr unsafe.Pointer, aligned
 
 //go:nosplit
 //go:inline
-func fixedManualAllocatorFindRef(instance *FixedManualAllocator, ptr unsafe.Pointer) (ptrRecord, uint64) {
+func fixedManualAllocatorFindRef(instance *FixedManualAllocator, ptr unsafe.Pointer) (*ptrRecord, uint64) {
 	refIdx, err := primitives.FixedOrderedListBinarySearch(instance.ptrRefs, func(item ptrRecord) int8 {
 		addr := uintptr(ptr)
 		switch {
@@ -306,12 +301,12 @@ func fixedManualAllocatorFindRef(instance *FixedManualAllocator, ptr unsafe.Poin
 	if err != nil {
 		panic("cannot free: unknown pointer")
 	}
-	return primitives.FixedOrderedListItemGetAtUnsafe(instance.ptrRefs, refIdx), refIdx
+	return primitives.FixedOrderedListItemPtrGetAtUnsafe(instance.ptrRefs, refIdx), refIdx
 }
 
 //go:nosplit
 //go:inline
-func fixedManualAllocatorFindAdjacentRegions(instance *FixedManualAllocator, ptrRef ptrRecord) (uint64, uint64) {
+func fixedManualAllocatorFindAdjacentRegions(instance *FixedManualAllocator, ptrRef *ptrRecord) (uint64, uint64) {
 	return primitives.FixedOrderedListBinarySearchInterval(instance.freeMemory, func(item freeMemoryRegionBlock) int8 {
 		if item.memStartIdx < ptrRef.idx {
 			return -1
@@ -321,7 +316,7 @@ func fixedManualAllocatorFindAdjacentRegions(instance *FixedManualAllocator, ptr
 }
 
 //go:nosplit
-func fixedManualAllocatorMergeOrInsert(instance *FixedManualAllocator, ptrRef ptrRecord, prevIdx, nextIdx uint64) {
+func fixedManualAllocatorMergeOrInsert(instance *FixedManualAllocator, ptrRef *ptrRecord, prevIdx, nextIdx uint64) {
 	hasPrev := primitives.FixedOrderedListIsIdxValid(instance.freeMemory, prevIdx)
 	hasNext := primitives.FixedOrderedListIsIdxValid(instance.freeMemory, nextIdx)
 
@@ -339,9 +334,9 @@ func fixedManualAllocatorMergeOrInsert(instance *FixedManualAllocator, ptrRef pt
 
 //go:nosplit
 //go:inline
-func fixedManualAllocatorMergePrevNext(instance *FixedManualAllocator, ptrRef ptrRecord, prevIdx, nextIdx uint64) {
-	prev := primitives.FixedOrderedListItemGetAtUnsafe(instance.freeMemory, prevIdx)
-	next := primitives.FixedOrderedListItemGetAtUnsafe(instance.freeMemory, nextIdx)
+func fixedManualAllocatorMergePrevNext(instance *FixedManualAllocator, ptrRef *ptrRecord, prevIdx, nextIdx uint64) {
+	prev := primitives.FixedOrderedListItemPtrGetAtUnsafe(instance.freeMemory, prevIdx)
+	next := primitives.FixedOrderedListItemPtrGetAtUnsafe(instance.freeMemory, nextIdx)
 
 	canMergePrev := canMergeRegions(prev.memStartIdx, prev.sizeBytes, ptrRef.idx)
 	canMergeNext := canMergeRegions(ptrRef.idx, ptrRef.sizeBytes, next.memStartIdx)
@@ -363,8 +358,8 @@ func fixedManualAllocatorMergePrevNext(instance *FixedManualAllocator, ptrRef pt
 
 //go:nosplit
 //go:inline
-func fixedManualAllocatorMergePrev(instance *FixedManualAllocator, ptrRef ptrRecord, prevIdx, nextIdx uint64) {
-	prev := primitives.FixedOrderedListItemGetAtUnsafe(instance.freeMemory, prevIdx)
+func fixedManualAllocatorMergePrev(instance *FixedManualAllocator, ptrRef *ptrRecord, prevIdx, nextIdx uint64) {
+	prev := primitives.FixedOrderedListItemPtrGetAtUnsafe(instance.freeMemory, prevIdx)
 	if !canMergeRegions(prev.memStartIdx, prev.sizeBytes, ptrRef.idx) {
 		pushFreePointer(instance, ptrRef, nextIdx)
 		return
@@ -375,8 +370,8 @@ func fixedManualAllocatorMergePrev(instance *FixedManualAllocator, ptrRef ptrRec
 
 //go:nosplit
 //go:inline
-func fixedManualAllocatorMergeNext(instance *FixedManualAllocator, ptrRef ptrRecord, nextIdx uint64) {
-	next := primitives.FixedOrderedListItemGetAtUnsafe(instance.freeMemory, nextIdx)
+func fixedManualAllocatorMergeNext(instance *FixedManualAllocator, ptrRef *ptrRecord, nextIdx uint64) {
+	next := primitives.FixedOrderedListItemPtrGetAtUnsafe(instance.freeMemory, nextIdx)
 	if !canMergeRegions(ptrRef.idx, ptrRef.sizeBytes, next.memStartIdx) {
 		pushFreePointer(instance, ptrRef, nextIdx)
 		return
@@ -388,11 +383,9 @@ func fixedManualAllocatorMergeNext(instance *FixedManualAllocator, ptrRef ptrRec
 //go:nosplit
 //go:inline
 func updateFreeRegion(instance *FixedManualAllocator, mdIdx, memIdx, memSize uint64) {
-	newFreeRegion := freeMemoryRegionBlock{
-		memStartIdx: memIdx,
-		sizeBytes:   memSize,
-	}
-	primitives.FixedOrderedListSetAtUnsafe(instance.freeMemory, mdIdx, newFreeRegion)
+	freeRegion := primitives.FixedOrderedListItemPtrGetAtUnsafe(instance.freeMemory, mdIdx)
+	freeRegion.memStartIdx = memIdx
+	freeRegion.sizeBytes = memSize
 
 	if mdIdx < instance.regionIdxAreaHint {
 		instance.regionIdxAreaHint = mdIdx
@@ -401,7 +394,7 @@ func updateFreeRegion(instance *FixedManualAllocator, mdIdx, memIdx, memSize uin
 
 //go:nosplit
 //go:inline
-func pushFreePointer(instance *FixedManualAllocator, ptrRef ptrRecord, mdIdx uint64) {
+func pushFreePointer(instance *FixedManualAllocator, ptrRef *ptrRecord, mdIdx uint64) {
 	newFreeRegion := freeMemoryRegionBlock{
 		memStartIdx: ptrRef.idx,
 		sizeBytes:   ptrRef.sizeBytes,
@@ -452,7 +445,7 @@ func getFreeAlignedIdx(allocator *FixedManualAllocator, requestedSize, requested
 //go:inline
 func freeAlignedIdxLoop(startIdx, lastIdxExclusive uint64, allocator *FixedManualAllocator, requestedSize, requestedAlignment uint64) (uint64, uint64, uint64, uint64, error) {
 	for i := startIdx; i < lastIdxExclusive; i++ {
-		region := primitives.FixedOrderedListItemGetAtUnsafe(allocator.freeMemory, uint64(i))
+		region := primitives.FixedOrderedListItemPtrGetAtUnsafe(allocator.freeMemory, uint64(i))
 
 		regionAlignedIdx := alignIdxUp(region.memStartIdx, requestedAlignment)
 		if regionAlignedIdx < region.memStartIdx { // Check for overflow
