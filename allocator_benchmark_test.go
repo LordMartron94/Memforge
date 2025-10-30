@@ -31,11 +31,18 @@ func benchmarkWithMetrics(b *testing.B, fn func(b *testing.B)) {
 var goHeapSink any
 
 // Growth strategy for dynamic allocator
+const maxGrowthMem = 8 * 1024 * 1024
+
 func growthStrategy2x(currentCap, neededCap uint64) uint64 {
 	newCap := currentCap * 2
 	if newCap < neededCap {
 		newCap = neededCap
 	}
+
+	if newCap > maxGrowthMem {
+		panic(fmt.Sprintf("benchmark setup went wrong, more mem requested than available. requested=%v/available=%v", newCap, maxGrowthMem))
+	}
+
 	return newCap
 }
 
@@ -165,12 +172,13 @@ func BenchmarkAllocatorRealisticWorkloads(b *testing.B) {
 
 	// Simulate HTTP request handler pattern
 	b.Run("RequestCycle/GoHeap", func(b *testing.B) {
+		objects := make([][]byte, allocsPerRequest)
+
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				objects := make([][]byte, 0, allocsPerRequest)
 				for j := 0; j < allocsPerRequest; j++ {
 					obj := make([]byte, avgAllocSize)
-					objects = append(objects, obj)
+					objects[j] = obj
 				}
 				goHeapSink = objects
 			}
@@ -185,12 +193,13 @@ func BenchmarkAllocatorRealisticWorkloads(b *testing.B) {
 		allocator := FixedLinearAllocatorCreate(arenaSize)
 		defer FixedLinearAllocatorDestroy(allocator)
 
+		objects := make([]unsafe.Pointer, allocsPerRequest)
+
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				objects := make([]unsafe.Pointer, 0, allocsPerRequest)
 				for j := 0; j < allocsPerRequest; j++ {
 					ptr := FixedLinearAllocatorMalloc(allocator, avgAllocSize, 16)
-					objects = append(objects, ptr)
+					objects[j] = ptr
 				}
 				FixedLinearAllocatorReset(allocator)
 				goHeapSink = objects
@@ -205,12 +214,13 @@ func BenchmarkAllocatorRealisticWorkloads(b *testing.B) {
 		allocator := DynamicLinearAllocatorCreate(128*1024, growthStrategy2x)
 		defer DynamicLinearAllocatorDestroy(allocator)
 
+		objects := make([]Pointer, allocsPerRequest)
+
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				objects := make([]Pointer, 0, allocsPerRequest)
 				for j := 0; j < allocsPerRequest; j++ {
 					ptr := DynamicLinearAllocatorMalloc(allocator, avgAllocSize, 16)
-					objects = append(objects, ptr)
+					objects[j] = ptr
 				}
 				DynamicLinearAllocatorReset(allocator)
 				goHeapSink = objects
@@ -225,12 +235,13 @@ func BenchmarkAllocatorRealisticWorkloads(b *testing.B) {
 		allocator := FixedManualAllocatorCreate(1 * 1024 * 1024)
 		defer FixedManualAllocatorDestroy(allocator)
 
+		objects := make([]unsafe.Pointer, allocsPerRequest)
+
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				objects := make([]unsafe.Pointer, 0, allocsPerRequest)
 				for j := 0; j < allocsPerRequest; j++ {
 					ptr := FixedManualAllocatorMalloc(allocator, avgAllocSize, 16)
-					objects = append(objects, ptr)
+					objects[j] = ptr
 				}
 				// Free all at end of request
 				for _, ptr := range objects {
@@ -406,12 +417,14 @@ func BenchmarkFixedManualAllocatorSuite(b *testing.B) {
 		allocator := FixedManualAllocatorCreate(2 * 1024 * 1024)
 		defer FixedManualAllocatorDestroy(allocator)
 
+		ptrs := make([]unsafe.Pointer, allocsPerCycle)
+
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				ptrs := make([]unsafe.Pointer, 0, allocsPerCycle)
+
 				for j := 0; j < allocsPerCycle; j++ {
 					ptr := FixedManualAllocatorMalloc(allocator, avgSize, 16)
-					ptrs = append(ptrs, ptr)
+					ptrs[j] = ptr
 				}
 				for _, p := range ptrs {
 					FixedManualAllocatorFree(allocator, p)
@@ -464,22 +477,17 @@ func BenchmarkFixedManualAllocatorSuite(b *testing.B) {
 
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
+				defer func() {
+					// Free on full (OOM panic)
+					if r := recover(); r != nil {
+						for _, p := range allocated {
+							FixedManualAllocatorFree(allocator, p)
+						}
+						allocated = allocated[:0]
+					}
+				}()
 				ptr := FixedManualAllocatorMalloc(allocator, allocSize, 16)
-				if ptr == nil {
-					// Reset allocator when full
-					for _, p := range allocated {
-						FixedManualAllocatorFree(allocator, p)
-					}
-					allocated = allocated[:0]
-					continue
-				}
 				allocated = append(allocated, ptr)
-				if len(allocated) > 1000 {
-					for _, p := range allocated {
-						FixedManualAllocatorFree(allocator, p)
-					}
-					allocated = allocated[:0]
-				}
 				goHeapSink = ptr
 			}
 		})

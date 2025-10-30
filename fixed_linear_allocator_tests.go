@@ -172,13 +172,20 @@ func testUseAfterDestroyPanics(t *testing.T) {
 
 // ------------------------ tiny utilities ------------------------
 
-func mustPanic(t *testing.T, f func()) {
+func mustPanic(t *testing.T, fn func()) {
+	didPanic := false
 	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("expected panic, got none")
+		if r := recover(); r != nil {
+			didPanic = true
 		}
+		commontesting.Assert(
+			didPanic,
+			"expected panic but none occurred",
+			"panic occurred as expected",
+			t,
+		)
 	}()
-	f()
+	fn()
 }
 
 func fillBytes(b []byte, v byte) {

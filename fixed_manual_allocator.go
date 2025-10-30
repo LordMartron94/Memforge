@@ -220,7 +220,7 @@ func FixedManualAllocatorReset(instance *FixedManualAllocator) {
 	FixedLinearAllocatorReset(instance.metadataAllocator)
 	primitives.FixedOrderedListClear(instance.freeMemory)
 	primitives.FixedOrderedListClear(instance.ptrRefs)
-	primitives.FixedOrderedListAppend(instance.freeMemory, freeMemoryRegionBlock{
+	primitives.FixedOrderedListAppendUnsafe(instance.freeMemory, freeMemoryRegionBlock{
 		memStartIdx: 0,
 		sizeBytes:   instance.cap,
 	})
@@ -348,7 +348,7 @@ func fixedManualAllocatorMergePrevNext(instance *FixedManualAllocator, ptrRef *p
 		// Merge all three: prev + freed block + next
 		size := prev.sizeBytes + ptrRef.sizeBytes + next.sizeBytes
 		updateFreeRegion(instance, prevIdx, prev.memStartIdx, size)
-		primitives.FixedOrderedListDelete(instance.freeMemory, nextIdx)
+		primitives.FixedOrderedListDeleteUnsafe(instance.freeMemory, nextIdx)
 	case canMergePrev:
 		fixedManualAllocatorMergePrev(instance, ptrRef, prevIdx, nextIdx)
 	case canMergeNext:
@@ -455,7 +455,7 @@ func freeAlignedIdxLoop(startIdx, lastIdxExclusive uint64, allocator *FixedManua
 		}
 
 		spaceBefore := regionAlignedIdx - region.memStartIdx
-		if spaceBefore > region.sizeBytes { // Not enough space even for alignment
+		if spaceBefore > region.sizeBytes { // Not enough space for alignment
 			continue
 		}
 
