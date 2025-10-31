@@ -368,128 +368,161 @@ func BenchmarkAllocatorFragmentation(b *testing.B) {
 func BenchmarkFixedManualAllocatorSuite(b *testing.B) {
 	sizes := []int{16, 64, 256, 1024}
 
-	// Basic throughput comparison (malloc + free)
+	// -----------------------------------------
+	// 1. Basic throughput comparison (malloc + free)
+	// -----------------------------------------
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("Throughput/Size=%d", size), func(b *testing.B) {
-			gcPercent := debug.SetGCPercent(-1)
-			defer debug.SetGCPercent(gcPercent)
+			oldGC := debug.SetGCPercent(-1)
+			defer debug.SetGCPercent(oldGC)
 
 			allocator := FixedManualAllocatorCreate(8 * 1024 * 1024)
-			defer FixedManualAllocatorDestroy(allocator)
 
 			benchmarkWithMetrics(b, func(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					ptr := FixedManualAllocatorMalloc(allocator, uint64(size), 16)
-					goHeapSink = ptr
 					FixedManualAllocatorFree(allocator, ptr)
 				}
 			})
+
+			FixedManualAllocatorDestroy(allocator)
+			allocator = nil
+			runtime.GC()
 		})
 	}
 
-	// Sustained mixed-size allocations
+	// -----------------------------------------
+	// 2. Sustained mixed-size allocations
+	// -----------------------------------------
 	b.Run("MixedSizes", func(b *testing.B) {
-		sizes := []int{16, 32, 64, 128, 256, 512, 1024}
-		gcPercent := debug.SetGCPercent(-1)
-		defer debug.SetGCPercent(gcPercent)
+		blockSizes := []int{16, 32, 64, 128, 256, 512, 1024}
+		oldGC := debug.SetGCPercent(-1)
+		defer debug.SetGCPercent(oldGC)
 
 		allocator := FixedManualAllocatorCreate(8 * 1024 * 1024)
-		defer FixedManualAllocatorDestroy(allocator)
 
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				size := sizes[i%len(sizes)]
+				size := blockSizes[i%len(blockSizes)]
 				ptr := FixedManualAllocatorMalloc(allocator, uint64(size), 16)
-				goHeapSink = ptr
 				FixedManualAllocatorFree(allocator, ptr)
 			}
 		})
+
+		FixedManualAllocatorDestroy(allocator)
+		allocator = nil
+		runtime.GC()
 	})
 
-	// Realistic workload — allocate N objects and free all
+	// -----------------------------------------
+	// 3. Request cycle pattern — allocate N objects then free all
+	// -----------------------------------------
 	b.Run("RequestCyclePattern", func(b *testing.B) {
 		const allocsPerCycle = 100
 		const avgSize = 128
 
-		gcPercent := debug.SetGCPercent(-1)
-		defer debug.SetGCPercent(gcPercent)
+		oldGC := debug.SetGCPercent(-1)
+		defer debug.SetGCPercent(oldGC)
 
 		allocator := FixedManualAllocatorCreate(2 * 1024 * 1024)
-		defer FixedManualAllocatorDestroy(allocator)
-
 		ptrs := make([]unsafe.Pointer, allocsPerCycle)
 
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-
 				for j := 0; j < allocsPerCycle; j++ {
-					ptr := FixedManualAllocatorMalloc(allocator, avgSize, 16)
-					ptrs[j] = ptr
+					ptrs[j] = FixedManualAllocatorMalloc(allocator, avgSize, 16)
 				}
 				for _, p := range ptrs {
 					FixedManualAllocatorFree(allocator, p)
 				}
-				goHeapSink = ptrs
 			}
 		})
+
+		// cleanup
+		for i := range ptrs {
+			ptrs[i] = nil
+		}
+		ptrs = nil
+		FixedManualAllocatorDestroy(allocator)
+		allocator = nil
+		runtime.GC()
 	})
 
-	// Fragmentation simulation (interleaved alloc/free)
+	// -----------------------------------------
+	// 4. Fragmentation simulation (interleaved alloc/free)
+	// -----------------------------------------
 	b.Run("FragmentationPattern", func(b *testing.B) {
 		const preAllocCount = 1000
 		const blockSize = 128
 
-		gcPercent := debug.SetGCPercent(-1)
-		defer debug.SetGCPercent(gcPercent)
+		oldGC := debug.SetGCPercent(-1)
+		defer debug.SetGCPercent(oldGC)
 
 		allocator := FixedManualAllocatorCreate(8 * 1024 * 1024)
-		defer FixedManualAllocatorDestroy(allocator)
-
 		ptrs := make([]unsafe.Pointer, preAllocCount)
+
 		for i := range ptrs {
 			ptrs[i] = FixedManualAllocatorMalloc(allocator, blockSize, 16)
 		}
 		for i := 0; i < preAllocCount; i += 2 {
 			FixedManualAllocatorFree(allocator, ptrs[i])
+			ptrs[i] = nil
 		}
 
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				ptr := FixedManualAllocatorMalloc(allocator, blockSize, 16)
-				goHeapSink = ptr
 				FixedManualAllocatorFree(allocator, ptr)
 			}
 		})
+
+		for i := range ptrs {
+			ptrs[i] = nil
+		}
+		ptrs = nil
+		FixedManualAllocatorDestroy(allocator)
+		allocator = nil
+		runtime.GC()
 	})
 
-	// Stress test: continuously allocate until exhaustion then reset
+	// -----------------------------------------
+	// 5. Stress test — allocate until exhaustion then reset
+	// -----------------------------------------
 	b.Run("Stress/ExhaustionAndReset", func(b *testing.B) {
-		gcPercent := debug.SetGCPercent(-1)
-		defer debug.SetGCPercent(gcPercent)
-
 		const arenaSize = 16 * 1024 * 1024
 		const allocSize = 128
 
-		allocator := FixedManualAllocatorCreate(arenaSize)
-		defer FixedManualAllocatorDestroy(allocator)
+		oldGC := debug.SetGCPercent(-1)
+		defer debug.SetGCPercent(oldGC)
 
+		allocator := FixedManualAllocatorCreate(arenaSize)
 		var allocated []unsafe.Pointer
 
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				defer func() {
-					// Free on full (OOM panic)
+					// Recover from manual allocator exhaustion (OOM)
 					if r := recover(); r != nil {
 						for _, p := range allocated {
 							FixedManualAllocatorFree(allocator, p)
 						}
 						allocated = allocated[:0]
+						FixedManualAllocatorReset(allocator)
 					}
 				}()
+
 				ptr := FixedManualAllocatorMalloc(allocator, allocSize, 16)
 				allocated = append(allocated, ptr)
-				goHeapSink = ptr
 			}
 		})
+
+		// cleanup
+		for i := range allocated {
+			allocated[i] = nil
+		}
+		allocated = nil
+		FixedManualAllocatorDestroy(allocator)
+		allocator = nil
+		runtime.GC()
 	})
 }
