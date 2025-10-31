@@ -1,6 +1,3 @@
-// Package memforge is a custom allocation implementation.
-//
-// It aims to be blazingly fast and give manual control (C-like) to clients.
 package memforge
 
 import (
