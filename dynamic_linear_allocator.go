@@ -69,7 +69,7 @@ func DynamicLinearAllocatorCreate(initialCapacityBytes uint, growthStrategy Grow
 // Do NOT use the allocator anymore.
 func DynamicLinearAllocatorDestroy(allocator *DynamicLinearAllocator) {
 	memcore.MemmapUnmap(allocator.storage)
-	memforgeAllocatorRemoveAll(unsafe.Pointer(allocator))
+	memforgeAllocatorDestroy(unsafe.Pointer(allocator))
 	*allocator = DynamicLinearAllocator{destroyed: true}
 }
 

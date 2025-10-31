@@ -15,6 +15,7 @@ var debugStats = make(map[uintptr]*allocatorStats)
 
 type allocatorStats struct {
 	allocatorName                                        string
+	destroyed                                            bool
 	createdAt                                            time.Time
 	creator                                              string // file:line (func)
 	allAllocations                                       []allocation
@@ -93,7 +94,14 @@ func memforgeAllocationRemove(allocatorPtr, allocationPtr unsafe.Pointer) {
 	})
 }
 
-// Remove all allocations for a destroyed allocator.
+// Marks an allocator as destroyed.
+func memforgeAllocatorDestroy(allocatorPtr unsafe.Pointer) {
+	memforgeAllocatorRemoveAll(allocatorPtr)
+	stats := debugStats[uintptr(allocatorPtr)]
+	stats.destroyed = true
+}
+
+// Remove all allocations for an allocator.
 func memforgeAllocatorRemoveAll(allocatorPtr unsafe.Pointer) {
 	stats := debugStats[uintptr(allocatorPtr)]
 	if stats == nil {
@@ -153,10 +161,18 @@ func writeHeader(sb *strings.Builder) {
 }
 
 func writeGlobalSummary(sb *strings.Builder, totals globalTotals, typeCount, allocatorCount int) {
+	destroyedCount := 0
+	for _, st := range debugStats {
+		if st.destroyed {
+			destroyedCount++
+		}
+	}
+
 	sb.WriteString("\n━━━━━━━━━━━━━━━━━━━━━━━\n")
 	sb.WriteString("📊 GLOBAL SUMMARY\n")
 	sb.WriteString(fmt.Sprintf("  Allocator types: %d\n", typeCount))
-	sb.WriteString(fmt.Sprintf("  Total allocators: %d\n", allocatorCount))
+	sb.WriteString(fmt.Sprintf("  Total allocators: %d (destroyed=%d, active=%d)\n",
+		allocatorCount, destroyedCount, allocatorCount-destroyedCount))
 	sb.WriteString(fmt.Sprintf("  Total allocations: %d\n", totals.totalAllocs))
 	sb.WriteString(fmt.Sprintf("  Live allocations:  %d\n", totals.totalLiveAllocs))
 	sb.WriteString(fmt.Sprintf("  Bytes total: %s   Live: %s\n",
@@ -202,8 +218,17 @@ func computeTypeTotals(ptrs []uintptr) globalTotals {
 
 func writeTypeSummary(sb *strings.Builder, name string, ptrs []uintptr, totals globalTotals) {
 	sb.WriteString(fmt.Sprintf("\n📦 %s\n", name))
-	sb.WriteString(fmt.Sprintf("  allocators: %d  total=%s  live=%s  leaks=%d\n",
-		len(ptrs),
+	destroyedCount := 0
+	for _, addr := range ptrs {
+		if debugStats[addr].destroyed {
+			destroyedCount++
+		}
+	}
+	activeCount := len(ptrs) - destroyedCount
+
+	sb.WriteString(fmt.Sprintf("  allocators: %d (active=%d, destroyed=%d)\n",
+		len(ptrs), activeCount, destroyedCount))
+	sb.WriteString(fmt.Sprintf("  total=%s  live=%s  leaks=%d\n",
 		humanBytes(float64(totals.totalBytes)),
 		humanBytes(float64(totals.totalLiveBytes)),
 		totals.totalLiveAllocs))
@@ -227,13 +252,27 @@ func writeAllocatorSummary(sb *strings.Builder, addr uintptr) {
 		return
 	}
 
-	sb.WriteString(fmt.Sprintf("    → %#x  allocs=%-3d live=%-3d bytes=%-10s\n",
-		addr, allocCount, liveCount, humanBytes(float64(st.totalBytes))))
+	// Determine status
+	status := allocatorStatus(st)
+
+	sb.WriteString(fmt.Sprintf("    → %#x  allocs=%-3d live=%-3d bytes=%-10s %s\n",
+		addr, allocCount, liveCount, humanBytes(float64(st.totalBytes)), status))
 	sb.WriteString(fmt.Sprintf("      created %s | %s\n",
 		st.createdAt.Format("15:04:05"), st.creator))
 
 	if liveCount > 0 {
 		writeLiveAllocations(sb, st.currentlyLiveAllocations)
+	}
+}
+
+func allocatorStatus(st *allocatorStats) string {
+	switch {
+	case st.destroyed && len(st.currentlyLiveAllocations) > 0:
+		return "🚨 [DESTROYED — LEAKED]"
+	case st.destroyed:
+		return "✅ [DESTROYED]"
+	default:
+		return "⚠️ [ACTIVE]"
 	}
 }
 

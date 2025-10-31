@@ -80,7 +80,7 @@ func SlabAllocatorCreate[T any](capacity uint64) *FixedSlabAllocator[T] {
 func SlabAllocatorDestroy[T any](instance *FixedSlabAllocator[T]) {
 	memcore.MemmapUnmap(instance.storage)
 	FixedLinearAllocatorDestroy(instance.metaAllocator)
-	memforgeAllocatorRemoveAll(unsafe.Pointer(instance))
+	memforgeAllocatorDestroy(unsafe.Pointer(instance))
 
 	instance.storage = nil
 	instance.metaAllocator = nil

@@ -53,7 +53,7 @@ func FixedLinearAllocatorCreate(sizeBytes int) *FixedLinearAllocator {
 // Do NOT use the allocator anymore.
 func FixedLinearAllocatorDestroy(allocator *FixedLinearAllocator) {
 	memcore.MemmapUnmap(allocator.storage)
-	memforgeAllocatorRemoveAll(unsafe.Pointer(allocator))
+	memforgeAllocatorDestroy(unsafe.Pointer(allocator))
 	*allocator = FixedLinearAllocator{destroyed: true}
 }
 
