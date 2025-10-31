@@ -38,14 +38,14 @@ func SlabAllocatorCreate[T any](capacity uint64) *FixedSlabAllocator[T] {
 		panic("cannot create slab allocator with capacity of 0")
 	}
 
-	dataBytes := primitives.ContainerRequiredBytes[T](capacity)
+	dataBytes := primitives.ArrayRequiredBytesGet[T](capacity)
 	mmap, err := memcore.MemmapRequest(int(dataBytes), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
 
 	if err != nil {
 		panic(fmt.Errorf("failure to create slab allocator: %w", err))
 	}
 
-	stackBytes := primitives.ContainerRequiredBytes[uint64](capacity)
+	stackBytes := primitives.ArrayRequiredBytesGet[uint64](capacity)
 
 	metaAllocator := FixedLinearAllocatorCreate(int(stackBytes))
 	stackAddr := FixedLinearAllocatorMalloc(metaAllocator, stackBytes, memcore.AlignOf[uint64]())
