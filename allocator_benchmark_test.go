@@ -485,44 +485,34 @@ func BenchmarkFixedManualAllocatorSuite(b *testing.B) {
 		runtime.GC()
 	})
 
+	var sink uintptr
+
 	// -----------------------------------------
 	// 5. Stress test — allocate until exhaustion then reset
 	// -----------------------------------------
 	b.Run("Stress/ExhaustionAndReset", func(b *testing.B) {
 		const arenaSize = 16 * 1024 * 1024
 		const allocSize = 128
+		const allocsPerCycle = arenaSize / allocSize
 
 		oldGC := debug.SetGCPercent(-1)
 		defer debug.SetGCPercent(oldGC)
 
 		allocator := FixedManualAllocatorCreate(arenaSize)
-		var allocated []unsafe.Pointer
+		defer FixedManualAllocatorDestroy(allocator)
 
 		benchmarkWithMetrics(b, func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				defer func() {
-					// Recover from manual allocator exhaustion (OOM)
-					if r := recover(); r != nil {
-						for _, p := range allocated {
-							FixedManualAllocatorFree(allocator, p)
-						}
-						allocated = allocated[:0]
-						FixedManualAllocatorReset(allocator)
-					}
-				}()
 
-				ptr := FixedManualAllocatorMalloc(allocator, allocSize, 16)
-				allocated = append(allocated, ptr)
+			for i := 0; i < b.N; i++ {
+				for j := 0; j < allocsPerCycle-10; j++ {
+					ptr := FixedManualAllocatorMalloc(allocator, allocSize, 16)
+					sink ^= uintptr(ptr)
+				}
+				FixedManualAllocatorReset(allocator)
+			}
+			if sink == 0 {
+				b.Errorf("impossible sink value")
 			}
 		})
-
-		// cleanup
-		for i := range allocated {
-			allocated[i] = nil
-		}
-		allocated = nil
-		FixedManualAllocatorDestroy(allocator)
-		allocator = nil
-		runtime.GC()
 	})
 }

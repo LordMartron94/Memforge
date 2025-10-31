@@ -63,8 +63,7 @@ func FixedManualAllocatorCreate(sizeBytes uint) *FixedManualAllocator {
 
 	// --- Create a single metadata allocator ---
 	totalMetadataBytes := ptrRefBytes + freeListBytes + 4*1024 // small padding margin
-	metadataAllocationSize := max(64*1024, totalMetadataBytes)
-	metadataAllocator := FixedLinearAllocatorCreate(int(metadataAllocationSize))
+	metadataAllocator := FixedLinearAllocatorCreate(int(totalMetadataBytes))
 
 	// --- Allocate each metadata table separately ---
 	ptrRefsTableAddr := FixedLinearAllocatorMalloc(
@@ -282,7 +281,7 @@ func insertPtrRecord(instance *FixedManualAllocator, ptr unsafe.Pointer, aligned
 		return 1
 	})
 	if err := primitives.FixedOrderedListInsertAt(instance.ptrRefs, insertionIdx, newRecord); err != nil {
-		panic("pointer reference table overflow or corruption")
+		panic(fmt.Errorf("pointer reference table overflow or corruption: %w", err))
 	}
 }
 
