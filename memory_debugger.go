@@ -110,127 +110,161 @@ func MemforgeMemoryDebug() {
 		return
 	}
 
-	var (
-		totalAllocs, totalLiveAllocs int
-		totalBytes, totalLiveBytes   uint64
-		sb                           strings.Builder
-	)
+	sb := strings.Builder{}
 
-	sb.WriteString("\n━━━━━━━━━━━━━━━━━━━━━━━\n")
-	sb.WriteString("🧩 MEMFORGE MEMORY DEBUGGER\n")
-	sb.WriteString(fmt.Sprintf("Time: %s\n", time.Now().Format(time.RFC3339)))
-	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━━\n")
+	writeHeader(&sb)
+	typeGroups := groupAllocatorsByType(debugStats)
+	typeNames := sortedTypeNames(typeGroups)
 
-	// --- aggregate by allocator type ---
-	typeGroup := make(map[string][]uintptr)
-	for ptr, stats := range debugStats {
-		typeGroup[stats.allocatorName] = append(typeGroup[stats.allocatorName], ptr)
-	}
-
-	// Sort allocator types alphabetically
-	typeNames := make([]string, 0, len(typeGroup))
-	for name := range typeGroup {
-		typeNames = append(typeNames, name)
-	}
-	slices.Sort(typeNames)
+	var totals globalTotals
 
 	for _, name := range typeNames {
-		ptrs := typeGroup[name]
+		ptrs := typeGroups[name]
+		typeTotal := computeTypeTotals(ptrs)
 
-		// Compute totals per type
-		typeTotalAllocs, typeLiveAllocs := 0, 0
-		typeTotalBytes, typeLiveBytes := uint64(0), uint64(0)
-		for _, p := range ptrs {
-			st := debugStats[p]
-			typeTotalAllocs += len(st.allAllocations)
-			typeLiveAllocs += len(st.currentlyLiveAllocations)
-			typeTotalBytes += st.totalBytes
-			typeLiveBytes += st.liveBytes
-		}
+		totals.add(typeTotal)
 
-		totalAllocs += typeTotalAllocs
-		totalLiveAllocs += typeLiveAllocs
-		totalBytes += typeTotalBytes
-		totalLiveBytes += typeLiveBytes
-
-		sb.WriteString(fmt.Sprintf("\n📦 %s\n", name))
-		sb.WriteString(fmt.Sprintf("  allocators: %d  total=%s  live=%s  leaks=%d\n",
-			len(ptrs),
-			humanBytes(float64(typeTotalBytes)),
-			humanBytes(float64(typeLiveBytes)),
-			typeLiveAllocs))
-
-		// If only a few allocators of this type, print them individually.
-		if len(ptrs) <= 5 || typeLiveAllocs > 0 {
-			for _, addr := range ptrs {
-				st := debugStats[addr]
-				if len(st.allAllocations) == 0 {
-					continue
-				}
-				allocCount := len(st.allAllocations)
-				liveCount := len(st.currentlyLiveAllocations)
-				if allocCount == 0 && liveCount == 0 {
-					continue
-				}
-
-				sb.WriteString(fmt.Sprintf("    → %#x  allocs=%-3d live=%-3d bytes=%-10s\n",
-					addr, allocCount, liveCount, humanBytes(float64(st.totalBytes))))
-				sb.WriteString(fmt.Sprintf("      created %s | %s\n",
-					st.createdAt.Format("15:04:05"), st.creator))
-
-				if liveCount > 0 {
-					live := slices.Clone(st.currentlyLiveAllocations)
-					slices.SortFunc(live, func(a, b allocation) int {
-						switch {
-						case a.sizeBytes > b.sizeBytes:
-							return -1
-						case a.sizeBytes < b.sizeBytes:
-							return 1
-						default:
-							return 0
-						}
-					})
-
-					sb.WriteString("      🔴 Live allocations:\n")
-					for i := 0; i < min(3, len(live)); i++ {
-						sb.WriteString(fmt.Sprintf("        • %#x  %s  at %s\n",
-							live[i].ptr,
-							humanBytes(float64(live[i].sizeBytes)),
-							live[i].timestamp.Format("15:04:05")))
-
-						if live[i].stack != "" {
-							stack := indent(live[i].stack, "          ")
-							sb.WriteString(stack)
-							sb.WriteRune('\n')
-						}
-					}
-				}
-			}
-		}
+		writeTypeSummary(&sb, name, ptrs, typeTotal)
 	}
 
-	// --- global summary ---
-	sb.WriteString("\n━━━━━━━━━━━━━━━━━━━━━━━\n")
-	sb.WriteString("📊 GLOBAL SUMMARY\n")
-	sb.WriteString(fmt.Sprintf("  Allocator types: %d\n", len(typeNames)))
-	sb.WriteString(fmt.Sprintf("  Total allocators: %d\n", len(debugStats)))
-	sb.WriteString(fmt.Sprintf("  Total allocations: %d\n", totalAllocs))
-	sb.WriteString(fmt.Sprintf("  Live allocations:  %d\n", totalLiveAllocs))
-	sb.WriteString(fmt.Sprintf("  Bytes total: %s   Live: %s\n",
-		humanBytes(float64(totalBytes)),
-		humanBytes(float64(totalLiveBytes))))
-
-	if totalLiveAllocs > 0 {
-		sb.WriteString(fmt.Sprintf("  🚨 %d live allocations remain across all allocators\n", totalLiveAllocs))
-	} else {
-		sb.WriteString("  ✅ All memory freed — no leaks detected\n")
-	}
-	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━━\n")
-
+	writeGlobalSummary(&sb, totals, len(typeNames), len(debugStats))
 	fmt.Println(sb.String())
 }
 
 // --- helpers ---
+
+type globalTotals struct {
+	totalAllocs, totalLiveAllocs int
+	totalBytes, totalLiveBytes   uint64
+}
+
+func (t *globalTotals) add(other globalTotals) {
+	t.totalAllocs += other.totalAllocs
+	t.totalLiveAllocs += other.totalLiveAllocs
+	t.totalBytes += other.totalBytes
+	t.totalLiveBytes += other.totalLiveBytes
+}
+
+func writeHeader(sb *strings.Builder) {
+	sb.WriteString("\n━━━━━━━━━━━━━━━━━━━━━━━\n")
+	sb.WriteString("🧩 MEMFORGE MEMORY DEBUGGER\n")
+	sb.WriteString(fmt.Sprintf("Time: %s\n", time.Now().Format(time.RFC3339)))
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━━\n")
+}
+
+func writeGlobalSummary(sb *strings.Builder, totals globalTotals, typeCount, allocatorCount int) {
+	sb.WriteString("\n━━━━━━━━━━━━━━━━━━━━━━━\n")
+	sb.WriteString("📊 GLOBAL SUMMARY\n")
+	sb.WriteString(fmt.Sprintf("  Allocator types: %d\n", typeCount))
+	sb.WriteString(fmt.Sprintf("  Total allocators: %d\n", allocatorCount))
+	sb.WriteString(fmt.Sprintf("  Total allocations: %d\n", totals.totalAllocs))
+	sb.WriteString(fmt.Sprintf("  Live allocations:  %d\n", totals.totalLiveAllocs))
+	sb.WriteString(fmt.Sprintf("  Bytes total: %s   Live: %s\n",
+		humanBytes(float64(totals.totalBytes)),
+		humanBytes(float64(totals.totalLiveBytes))))
+
+	if totals.totalLiveAllocs > 0 {
+		sb.WriteString(fmt.Sprintf("  🚨 %d live allocations remain across all allocators\n", totals.totalLiveAllocs))
+	} else {
+		sb.WriteString("  ✅ All memory freed — no leaks detected\n")
+	}
+	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━━\n")
+}
+
+func groupAllocatorsByType(stats map[uintptr]*allocatorStats) map[string][]uintptr {
+	group := make(map[string][]uintptr)
+	for ptr, st := range stats {
+		group[st.allocatorName] = append(group[st.allocatorName], ptr)
+	}
+	return group
+}
+
+func sortedTypeNames(group map[string][]uintptr) []string {
+	names := make([]string, 0, len(group))
+	for name := range group {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+func computeTypeTotals(ptrs []uintptr) globalTotals {
+	var totals globalTotals
+	for _, p := range ptrs {
+		st := debugStats[p]
+		totals.totalAllocs += len(st.allAllocations)
+		totals.totalLiveAllocs += len(st.currentlyLiveAllocations)
+		totals.totalBytes += st.totalBytes
+		totals.totalLiveBytes += st.liveBytes
+	}
+	return totals
+}
+
+func writeTypeSummary(sb *strings.Builder, name string, ptrs []uintptr, totals globalTotals) {
+	sb.WriteString(fmt.Sprintf("\n📦 %s\n", name))
+	sb.WriteString(fmt.Sprintf("  allocators: %d  total=%s  live=%s  leaks=%d\n",
+		len(ptrs),
+		humanBytes(float64(totals.totalBytes)),
+		humanBytes(float64(totals.totalLiveBytes)),
+		totals.totalLiveAllocs))
+
+	if len(ptrs) <= 5 || totals.totalLiveAllocs > 0 {
+		for _, addr := range ptrs {
+			writeAllocatorSummary(sb, addr)
+		}
+	}
+}
+
+func writeAllocatorSummary(sb *strings.Builder, addr uintptr) {
+	st := debugStats[addr]
+	if len(st.allAllocations) == 0 {
+		return
+	}
+
+	allocCount := len(st.allAllocations)
+	liveCount := len(st.currentlyLiveAllocations)
+	if allocCount == 0 && liveCount == 0 {
+		return
+	}
+
+	sb.WriteString(fmt.Sprintf("    → %#x  allocs=%-3d live=%-3d bytes=%-10s\n",
+		addr, allocCount, liveCount, humanBytes(float64(st.totalBytes))))
+	sb.WriteString(fmt.Sprintf("      created %s | %s\n",
+		st.createdAt.Format("15:04:05"), st.creator))
+
+	if liveCount > 0 {
+		writeLiveAllocations(sb, st.currentlyLiveAllocations)
+	}
+}
+
+func writeLiveAllocations(sb *strings.Builder, allocs []allocation) {
+	live := slices.Clone(allocs)
+	slices.SortFunc(live, func(a, b allocation) int {
+		switch {
+		case a.sizeBytes > b.sizeBytes:
+			return -1
+		case a.sizeBytes < b.sizeBytes:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	sb.WriteString("      🔴 Live allocations:\n")
+	for i := 0; i < min(3, len(live)); i++ {
+		a := live[i]
+		sb.WriteString(fmt.Sprintf("        • %#x  %s  at %s\n",
+			a.ptr,
+			humanBytes(float64(a.sizeBytes)),
+			a.timestamp.Format("15:04:05")))
+
+		if a.stack != "" {
+			stack := indent(a.stack, "          ")
+			sb.WriteString(stack)
+			sb.WriteRune('\n')
+		}
+	}
+}
 
 func humanBytes(b float64) string {
 	switch {
