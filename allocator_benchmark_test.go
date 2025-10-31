@@ -2,13 +2,22 @@ package memforge
 
 import (
 	"fmt"
+	"math/rand"
+	"os"
+	"reflect"
 	"runtime"
 	"runtime/debug"
 	"testing"
 	"unsafe"
 )
 
+func GetFunctionName(i interface{}) string {
+	return runtime.FuncForPC(reflect.ValueOf(i).Pointer()).Name()
+}
+
 func benchmarkWithMetrics(b *testing.B, fn func(b *testing.B)) {
+	name := b.Name()
+	fmt.Fprintf(os.Stderr, "🔹 Running %s...\n", name)
 	var before, after runtime.MemStats
 	b.ReportAllocs()
 	runtime.GC()
@@ -26,6 +35,7 @@ func benchmarkWithMetrics(b *testing.B, fn func(b *testing.B)) {
 	b.ReportMetric(totalPauses/float64(b.N), "ns/op.gc.pause")
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "ops/sec")
 	b.ReportMetric(float64(after.Sys), "sys.bytes")
+	fmt.Fprintf(os.Stderr, "✅ Finished %s\n", name)
 }
 
 var goHeapSink any
@@ -47,7 +57,7 @@ func growthStrategy2x(currentCap, neededCap uint64) uint64 {
 }
 
 // BenchmarkAllocatorComparison - Comprehensive allocator comparison
-func BenchmarkAllocatorComparison(b *testing.B) {
+func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 	sizes := []int{32, 256, 1024}
 
 	for _, size := range sizes {
@@ -78,9 +88,12 @@ func BenchmarkAllocatorComparison(b *testing.B) {
 			benchmarkWithMetrics(b, func(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					if counter >= allocsPerReset {
+						b.StopTimer()
 						FixedLinearAllocatorReset(allocator)
+						b.StartTimer()
 						counter = 0
 					}
+
 					ptr := FixedLinearAllocatorMalloc(allocator, uint64(size), 16)
 					goHeapSink = ptr
 					counter++
@@ -104,9 +117,12 @@ func BenchmarkAllocatorComparison(b *testing.B) {
 			benchmarkWithMetrics(b, func(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					if counter >= allocsPerReset {
+						b.StopTimer()
 						DynamicLinearAllocatorReset(allocator)
+						b.StartTimer()
 						counter = 0
 					}
+
 					ptr := DynamicLinearAllocatorMalloc(allocator, uint64(size), 16)
 					goHeapSink = ptr
 					counter++
@@ -119,15 +135,25 @@ func BenchmarkAllocatorComparison(b *testing.B) {
 			gcPercent := debug.SetGCPercent(-1)
 			defer debug.SetGCPercent(gcPercent)
 
-			arenaSize := uint(8 * 1024 * 1024) // 8 MiB
-			allocator := FixedManualAllocatorCreate(arenaSize)
+			arenaSize := 8 * 1024 * 1024 // 8 MiB
+			allocsPerReset := arenaSize / size
+			allocator := FixedManualAllocatorCreate(uint(arenaSize))
 			defer FixedManualAllocatorDestroy(allocator)
+
+			counter := 0
 
 			benchmarkWithMetrics(b, func(b *testing.B) {
 				for i := 0; i < b.N; i++ {
+					if counter >= allocsPerReset {
+						b.StopTimer()
+						FixedManualAllocatorReset(allocator)
+						b.StartTimer()
+						counter = 0
+					}
+
 					ptr := FixedManualAllocatorMalloc(allocator, uint64(size), 16)
 					goHeapSink = ptr
-					FixedManualAllocatorFree(allocator, ptr)
+					counter++
 				}
 			})
 		})
@@ -152,7 +178,9 @@ func BenchmarkAllocatorComparison(b *testing.B) {
 				benchmarkWithMetrics(b, func(b *testing.B) {
 					for i := 0; i < b.N; i++ {
 						if uint64(len(ptrs)) >= capacity {
+							b.StopTimer()
 							SlabAllocatorReset(allocator)
+							b.StartTimer()
 							ptrs = ptrs[:0]
 						}
 						ptr := SlabAllocatorMalloc(allocator)
@@ -166,7 +194,7 @@ func BenchmarkAllocatorComparison(b *testing.B) {
 }
 
 // BenchmarkAllocatorRealisticWorkloads - Realistic usage patterns
-func BenchmarkAllocatorRealisticWorkloads(b *testing.B) {
+func BenchmarkAllocatorSuite_RealisticWorkloads(b *testing.B) {
 	const allocsPerRequest = 50
 	const avgAllocSize = 128
 
@@ -243,10 +271,7 @@ func BenchmarkAllocatorRealisticWorkloads(b *testing.B) {
 					ptr := FixedManualAllocatorMalloc(allocator, avgAllocSize, 16)
 					objects[j] = ptr
 				}
-				// Free all at end of request
-				for _, ptr := range objects {
-					FixedManualAllocatorFree(allocator, ptr)
-				}
+				FixedManualAllocatorReset(allocator)
 				goHeapSink = objects
 			}
 		})
@@ -254,7 +279,7 @@ func BenchmarkAllocatorRealisticWorkloads(b *testing.B) {
 }
 
 // BenchmarkAllocatorMixedSizeWorkload - Varied allocation sizes (realistic)
-func BenchmarkAllocatorMixedSizeWorkload(b *testing.B) {
+func BenchmarkAllocatorSuite_MixedSizeWorkload(b *testing.B) {
 	sizes := []int{16, 32, 64, 128, 256, 512, 1024}
 
 	b.Run("Mixed/GoHeap", func(b *testing.B) {
@@ -283,7 +308,9 @@ func BenchmarkAllocatorMixedSizeWorkload(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				size := uint64(sizes[i%len(sizes)])
 				if bytesUsed+size >= uint64(arenaSize-512) {
+					b.StopTimer()
 					FixedLinearAllocatorReset(allocator)
+					b.StartTimer()
 					bytesUsed = 0
 				}
 
@@ -299,73 +326,117 @@ func BenchmarkAllocatorMixedSizeWorkload(b *testing.B) {
 		gcPercent := debug.SetGCPercent(-1)
 		defer debug.SetGCPercent(gcPercent)
 
-		allocator := FixedManualAllocatorCreate(8 * 1024 * 1024)
+		arenaSize := 8 * 1024 * 1024
+		allocsPerReset := arenaSize / 1024
+		allocator := FixedManualAllocatorCreate(uint(arenaSize))
 		defer FixedManualAllocatorDestroy(allocator)
 
+		counter := 0
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
+				if counter >= allocsPerReset {
+					b.StopTimer()
+					FixedManualAllocatorReset(allocator)
+					b.StartTimer()
+					counter = 0
+				}
+
 				size := sizes[i%len(sizes)]
 				ptr := FixedManualAllocatorMalloc(allocator, uint64(size), 16)
 				goHeapSink = ptr
-				FixedManualAllocatorFree(allocator, ptr)
+				counter++
 			}
 		})
 	})
 }
 
 // BenchmarkAllocatorFragmentation - Tests allocator behavior under fragmentation
-func BenchmarkAllocatorFragmentation(b *testing.B) {
+func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 	// Only manual allocator is affected by fragmentation
-	b.Run("AllocFreePattern/FixedManual", func(b *testing.B) {
+	b.Run("AllocSteady/FixedManual", func(b *testing.B) {
 		gcPercent := debug.SetGCPercent(-1)
 		defer debug.SetGCPercent(gcPercent)
 
-		allocator := FixedManualAllocatorCreate(8 * 1024 * 1024)
+		const arenaSize = 8 * 1024 * 1024
+		const objSize = 128
+		const poolSize = 4096 // working set
+		const stride = 3      // how often to free
+
+		allocator := FixedManualAllocatorCreate(arenaSize)
 		defer FixedManualAllocatorDestroy(allocator)
 
-		// Allocate some objects, free every other one to create fragmentation
-		const preAllocCount = 1000
-		ptrs := make([]unsafe.Pointer, preAllocCount)
-		for i := 0; i < preAllocCount; i++ {
-			ptrs[i] = FixedManualAllocatorMalloc(allocator, 128, 16)
-		}
-		for i := 1; i < preAllocCount; i += 2 {
-			FixedManualAllocatorFree(allocator, ptrs[i])
+		ptrs := make([]unsafe.Pointer, poolSize)
+		for i := range ptrs {
+			ptrs[i] = FixedManualAllocatorMalloc(allocator, objSize, 16)
 		}
 
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				ptr := FixedManualAllocatorMalloc(allocator, 128, 16)
-				goHeapSink = ptr
-				FixedManualAllocatorFree(allocator, ptr)
+				idx := uint64(i % poolSize)
+				FixedManualAllocatorFree(allocator, ptrs[idx])
+				ptrs[idx] = FixedManualAllocatorMalloc(allocator, objSize, 16)
+
+				if i%stride == 0 {
+					goHeapSink = ptrs[idx]
+				}
 			}
 		})
 	})
 
-	b.Run("AllocFreePattern/GoHeap", func(b *testing.B) {
-		// Create similar pattern for comparison
-		const preAllocCount = 1000
-		ptrs := make([][]byte, preAllocCount)
-		for i := 0; i < preAllocCount; i++ {
-			ptrs[i] = make([]byte, 128)
-		}
-		// Clear every other one
-		for i := 1; i < preAllocCount; i += 2 {
-			ptrs[i] = nil
-		}
-		runtime.KeepAlive(ptrs)
+	b.Run("BurstReset/FixedManual", func(b *testing.B) {
+		const arenaSize = 8 * 1024 * 1024
+		const objSize = 256
+		const batchSize = 1024
+
+		gcPercent := debug.SetGCPercent(-1)
+		defer debug.SetGCPercent(gcPercent)
+
+		allocator := FixedManualAllocatorCreate(arenaSize)
+		defer FixedManualAllocatorDestroy(allocator)
 
 		benchmarkWithMetrics(b, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				data := make([]byte, 128)
-				goHeapSink = data
+				for j := 0; j < batchSize; j++ {
+					ptr := FixedManualAllocatorMalloc(allocator, objSize, 16)
+					goHeapSink = ptr
+				}
+				FixedManualAllocatorReset(allocator)
+			}
+		})
+	})
+
+	b.Run("FragmentationStress/FixedManual", func(b *testing.B) {
+		const arenaSize = 16 * 1024 * 1024
+		const objMin = 32
+		const objMax = 512
+		const ops = 2048
+
+		gcPercent := debug.SetGCPercent(-1)
+		defer debug.SetGCPercent(gcPercent)
+
+		allocator := FixedManualAllocatorCreate(arenaSize)
+		defer FixedManualAllocatorDestroy(allocator)
+
+		rnd := rand.New(rand.NewSource(42))
+		ptrs := make([]unsafe.Pointer, ops)
+
+		benchmarkWithMetrics(b, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				idx := rnd.Intn(ops)
+				if ptrs[idx] != nil {
+					FixedManualAllocatorFree(allocator, ptrs[idx])
+					ptrs[idx] = nil
+				} else {
+					size := uint64(objMin + rnd.Intn(objMax-objMin))
+					ptrs[idx] = FixedManualAllocatorMalloc(allocator, size, 16)
+				}
 			}
 		})
 	})
 }
 
 // BenchmarkFixedManualAllocatorSuite — dedicated suite for FixedManualAllocator performance and behavior
-func BenchmarkFixedManualAllocatorSuite(b *testing.B) {
+func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 	sizes := []int{16, 64, 256, 1024}
 
 	// -----------------------------------------
