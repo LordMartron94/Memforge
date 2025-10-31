@@ -4,6 +4,7 @@ package memforge
 
 import (
 	"fmt"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -13,29 +14,35 @@ import (
 var debugStats = make(map[uintptr]*allocatorStats)
 
 type allocatorStats struct {
-	allocatorName            string
-	createdAt                time.Time
-	allAllocations           []allocation
-	currentlyLiveAllocations []allocation
-	totalBytes               uint64
-	liveBytes                uint64
-	peakLiveBytes            uint64
-	peakLiveAllocs           uint64
+	allocatorName                                        string
+	createdAt                                            time.Time
+	creator                                              string // file:line (func)
+	allAllocations                                       []allocation
+	currentlyLiveAllocations                             []allocation
+	totalBytes, liveBytes, peakLiveBytes, peakLiveAllocs uint64
 }
 
 type allocation struct {
 	ptr       uintptr
 	sizeBytes uint64
 	timestamp time.Time
+	stack     string // only captured when leak debugging
 }
 
+// Register a new allocator and record its creation site.
 func memforgeAllocatorRegister(allocatorPtr unsafe.Pointer, name string) {
+	var pcs [3]uintptr
+	n := runtime.Callers(2, pcs[:])
+	frame, _ := runtime.CallersFrames(pcs[:n]).Next()
+
 	debugStats[uintptr(allocatorPtr)] = &allocatorStats{
 		allocatorName: name,
 		createdAt:     time.Now(),
+		creator:       fmt.Sprintf("%s:%d (%s)", frame.File, frame.Line, frame.Function),
 	}
 }
 
+// Record a new allocation in the debug tracker.
 func memforgeAllocationAdd(allocatorPtr, allocationPtr unsafe.Pointer, sizeBytes uint64) {
 	ptr := uintptr(allocatorPtr)
 	stats := debugStats[ptr]
@@ -43,14 +50,22 @@ func memforgeAllocationAdd(allocatorPtr, allocationPtr unsafe.Pointer, sizeBytes
 		return
 	}
 
-	allocation := allocation{
+	// only capture stack when debugging mode enabled or large allocation
+	stack := ""
+	if sizeBytes > 4096 {
+		buf := make([]byte, 512)
+		n := runtime.Stack(buf, false)
+		stack = string(buf[:n])
+	}
+
+	entry := allocation{
 		ptr:       uintptr(allocationPtr),
 		sizeBytes: sizeBytes,
 		timestamp: time.Now(),
+		stack:     stack,
 	}
-
-	stats.allAllocations = append(stats.allAllocations, allocation)
-	stats.currentlyLiveAllocations = append(stats.currentlyLiveAllocations, allocation)
+	stats.allAllocations = append(stats.allAllocations, entry)
+	stats.currentlyLiveAllocations = append(stats.currentlyLiveAllocations, entry)
 	stats.totalBytes += sizeBytes
 	stats.liveBytes += sizeBytes
 
@@ -62,9 +77,9 @@ func memforgeAllocationAdd(allocatorPtr, allocationPtr unsafe.Pointer, sizeBytes
 	}
 }
 
+// Remove a single freed allocation.
 func memforgeAllocationRemove(allocatorPtr, allocationPtr unsafe.Pointer) {
-	ptr := uintptr(allocatorPtr)
-	stats := debugStats[ptr]
+	stats := debugStats[uintptr(allocatorPtr)]
 	if stats == nil {
 		return
 	}
@@ -78,9 +93,9 @@ func memforgeAllocationRemove(allocatorPtr, allocationPtr unsafe.Pointer) {
 	})
 }
 
+// Remove all allocations for a destroyed allocator.
 func memforgeAllocatorRemoveAll(allocatorPtr unsafe.Pointer) {
-	ptr := uintptr(allocatorPtr)
-	stats := debugStats[ptr]
+	stats := debugStats[uintptr(allocatorPtr)]
 	if stats == nil {
 		return
 	}
@@ -88,94 +103,146 @@ func memforgeAllocatorRemoveAll(allocatorPtr unsafe.Pointer) {
 	stats.liveBytes = 0
 }
 
-// MemforgeMemoryDebug prints the current state of allocations.
+// MemforgeMemoryDebug prints a focused summary of allocator usage and leaks.
 func MemforgeMemoryDebug() {
-	sb := strings.Builder{}
+	if len(debugStats) == 0 {
+		fmt.Println("🧩 Memforge: no allocators registered.")
+		return
+	}
+
+	var (
+		totalAllocs, totalLiveAllocs int
+		totalBytes, totalLiveBytes   uint64
+		sb                           strings.Builder
+	)
+
 	sb.WriteString("\n━━━━━━━━━━━━━━━━━━━━━━━\n")
 	sb.WriteString("🧩 MEMFORGE MEMORY DEBUGGER\n")
 	sb.WriteString(fmt.Sprintf("Time: %s\n", time.Now().Format(time.RFC3339)))
 	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━━\n")
 
-	var totalAllocs, liveAllocs int
-	var totalBytes, liveBytes uint64
+	// --- aggregate by allocator type ---
+	typeGroup := make(map[string][]uintptr)
+	for ptr, stats := range debugStats {
+		typeGroup[stats.allocatorName] = append(typeGroup[stats.allocatorName], ptr)
+	}
 
-	for addr, stats := range debugStats {
-		allAllocs := len(stats.allAllocations)
-		liveAllocs := len(stats.currentlyLiveAllocations)
-		totalAllocs += allAllocs
-		liveAllocs += liveAllocs
-		totalBytes += stats.totalBytes
-		liveBytes += stats.liveBytes
+	// Sort allocator types alphabetically
+	typeNames := make([]string, 0, len(typeGroup))
+	for name := range typeGroup {
+		typeNames = append(typeNames, name)
+	}
+	slices.Sort(typeNames)
 
-		fragmentationRatio := 0.0
-		if stats.totalBytes > 0 {
-			fragmentationRatio = float64(stats.liveBytes) / float64(stats.totalBytes)
+	for _, name := range typeNames {
+		ptrs := typeGroup[name]
+
+		// Compute totals per type
+		typeTotalAllocs, typeLiveAllocs := 0, 0
+		typeTotalBytes, typeLiveBytes := uint64(0), uint64(0)
+		for _, p := range ptrs {
+			st := debugStats[p]
+			typeTotalAllocs += len(st.allAllocations)
+			typeLiveAllocs += len(st.currentlyLiveAllocations)
+			typeTotalBytes += st.totalBytes
+			typeLiveBytes += st.liveBytes
 		}
 
-		sb.WriteString(fmt.Sprintf("\n📦 Allocator: %s (ptr=%#x)\n", stats.allocatorName, addr))
-		sb.WriteString(fmt.Sprintf("  Created:     %s\n", stats.createdAt.Format(time.Kitchen)))
-		sb.WriteString(fmt.Sprintf("  Total allocs: %d   Live: %d   Peak: %d\n", allAllocs, liveAllocs, stats.peakLiveAllocs))
-		sb.WriteString(fmt.Sprintf("  Bytes total:  %-10s   Live: %-10s   Peak: %-10s\n",
-			humanBytes(float64(stats.totalBytes)),
-			humanBytes(float64(stats.liveBytes)),
-			humanBytes(float64(stats.peakLiveBytes))))
-		sb.WriteString(fmt.Sprintf("  Fragmentation: %.1f%%\n", (1-fragmentationRatio)*100))
+		totalAllocs += typeTotalAllocs
+		totalLiveAllocs += typeLiveAllocs
+		totalBytes += typeTotalBytes
+		totalLiveBytes += typeLiveBytes
 
-		if liveAllocs > 0 {
-			// Sort by size descending
-			live := slices.Clone(stats.currentlyLiveAllocations)
-			slices.SortFunc(live, func(a, b allocation) int {
-				if a.sizeBytes > b.sizeBytes {
-					return -1
+		sb.WriteString(fmt.Sprintf("\n📦 %s\n", name))
+		sb.WriteString(fmt.Sprintf("  allocators: %d  total=%s  live=%s  leaks=%d\n",
+			len(ptrs),
+			humanBytes(float64(typeTotalBytes)),
+			humanBytes(float64(typeLiveBytes)),
+			typeLiveAllocs))
+
+		// If only a few allocators of this type, print them individually.
+		if len(ptrs) <= 5 || typeLiveAllocs > 0 {
+			for _, addr := range ptrs {
+				st := debugStats[addr]
+				if len(st.allAllocations) == 0 {
+					continue
 				}
-				if a.sizeBytes < b.sizeBytes {
-					return 1
+				allocCount := len(st.allAllocations)
+				liveCount := len(st.currentlyLiveAllocations)
+				if allocCount == 0 && liveCount == 0 {
+					continue
 				}
-				return 0
-			})
-			max := min(3, len(live))
-			sb.WriteString("  Top live allocations:\n")
-			for i := 0; i < max; i++ {
-				sb.WriteString(fmt.Sprintf("    • ptr=%#x size=%s at %s\n",
-					live[i].ptr,
-					humanBytes(float64(live[i].sizeBytes)),
-					live[i].timestamp.Format("15:04:05")))
+
+				sb.WriteString(fmt.Sprintf("    → %#x  allocs=%-3d live=%-3d bytes=%-10s\n",
+					addr, allocCount, liveCount, humanBytes(float64(st.totalBytes))))
+				sb.WriteString(fmt.Sprintf("      created %s | %s\n",
+					st.createdAt.Format("15:04:05"), st.creator))
+
+				if liveCount > 0 {
+					live := slices.Clone(st.currentlyLiveAllocations)
+					slices.SortFunc(live, func(a, b allocation) int {
+						switch {
+						case a.sizeBytes > b.sizeBytes:
+							return -1
+						case a.sizeBytes < b.sizeBytes:
+							return 1
+						default:
+							return 0
+						}
+					})
+
+					sb.WriteString("      🔴 Live allocations:\n")
+					for i := 0; i < min(3, len(live)); i++ {
+						sb.WriteString(fmt.Sprintf("        • %#x  %s  at %s\n",
+							live[i].ptr,
+							humanBytes(float64(live[i].sizeBytes)),
+							live[i].timestamp.Format("15:04:05")))
+
+						if live[i].stack != "" {
+							stack := indent(live[i].stack, "          ")
+							sb.WriteString(stack)
+							sb.WriteRune('\n')
+						}
+					}
+				}
 			}
 		}
 	}
 
+	// --- global summary ---
 	sb.WriteString("\n━━━━━━━━━━━━━━━━━━━━━━━\n")
 	sb.WriteString("📊 GLOBAL SUMMARY\n")
+	sb.WriteString(fmt.Sprintf("  Allocator types: %d\n", len(typeNames)))
 	sb.WriteString(fmt.Sprintf("  Total allocators: %d\n", len(debugStats)))
 	sb.WriteString(fmt.Sprintf("  Total allocations: %d\n", totalAllocs))
-	sb.WriteString(fmt.Sprintf("  Live allocations:  %d\n", liveAllocs))
+	sb.WriteString(fmt.Sprintf("  Live allocations:  %d\n", totalLiveAllocs))
 	sb.WriteString(fmt.Sprintf("  Bytes total: %s   Live: %s\n",
 		humanBytes(float64(totalBytes)),
-		humanBytes(float64(liveBytes))))
-	if liveAllocs > 0 {
-		sb.WriteString(fmt.Sprintf("🚨 WARNING: %d live allocations detected!\n", liveAllocs))
+		humanBytes(float64(totalLiveBytes))))
+
+	if totalLiveAllocs > 0 {
+		sb.WriteString(fmt.Sprintf("  🚨 %d live allocations remain across all allocators\n", totalLiveAllocs))
 	} else {
-		sb.WriteString("✅ No live allocations — all memory freed.\n")
+		sb.WriteString("  ✅ All memory freed — no leaks detected\n")
 	}
 	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━━\n")
 
 	fmt.Println(sb.String())
 }
 
+// --- helpers ---
+
 func humanBytes(b float64) string {
-	if b < 1024 {
+	switch {
+	case b < 1024:
 		return fmt.Sprintf("%.0f B", b)
+	case b < 1024*1024:
+		return fmt.Sprintf("%.2f KiB", b/1024)
+	case b < 1024*1024*1024:
+		return fmt.Sprintf("%.2f MiB", b/1024/1024)
+	default:
+		return fmt.Sprintf("%.2f GiB", b/1024/1024/1024)
 	}
-	k := b / 1024
-	if k < 1024 {
-		return fmt.Sprintf("%.2f KiB", k)
-	}
-	m := k / 1024
-	if m < 1024 {
-		return fmt.Sprintf("%.2f MiB", m)
-	}
-	g := m / 1024
-	return fmt.Sprintf("%.2f GiB", g)
 }
 
 func min(a, b int) int {
@@ -183,4 +250,12 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func indent(s, prefix string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	for i := range lines {
+		lines[i] = prefix + lines[i]
+	}
+	return strings.Join(lines, "\n")
 }

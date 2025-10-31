@@ -114,7 +114,7 @@ func FixedManualAllocatorDestroy(allocator *FixedManualAllocator) {
 		return
 	}
 	memcore.MemmapUnmap(allocator.storage)
-	memcore.MemmapUnmap(allocator.metadataAllocator.storage)
+	FixedLinearAllocatorDestroy(allocator.metadataAllocator)
 	memforgeAllocatorRemoveAll(unsafe.Pointer(allocator))
 	allocator.freeMemory = nil
 	allocator.ptrRefs = nil

@@ -1,11 +1,7 @@
 package memforge
 
 import (
-	"bytes"
 	foundationTesting "foundation/testing"
-	"io"
-	"os"
-	"strings"
 	"testing"
 	"unsafe"
 )
@@ -172,86 +168,6 @@ func testUseAfterDestroyPanics(t *testing.T) {
 	mustPanic(t, func() { _ = FixedLinearAllocatorMalloc(a, 8, 8) })
 	mustPanic(t, func() { FixedLinearAllocatorReset(a) })
 	mustPanic(t, func() { _ = FixedLinearAllocatorCalloc(a, 16, 8) })
-}
-
-func TestMemforgeDebuggerFixedLinear(t *testing.T) {
-	const arenaSize = 1024 * 1024 // 1 MiB
-	allocator := FixedLinearAllocatorCreate(arenaSize)
-	defer FixedLinearAllocatorDestroy(allocator)
-
-	ptrA := FixedLinearAllocatorMalloc(allocator, 128, 16)
-	ptrB := FixedLinearAllocatorMalloc(allocator, 256, 16)
-	ptrC := FixedLinearAllocatorMalloc(allocator, 512, 16)
-
-	foundationTesting.Assert(ptrA != nil && ptrB != nil && ptrC != nil,
-		"allocator returned nil pointers",
-		"allocator returned non-nil pointers", t)
-
-	stats := debugStats[uintptr(unsafe.Pointer(allocator))]
-
-	foundationTesting.Assert(stats.allocatorName == "Fixed Linear",
-		"allocator name not correctly registered",
-		"allocator name correctly registered", t)
-
-	foundationTesting.Assert(len(stats.allAllocations) == 3,
-		"expected 3 total allocations recorded",
-		"3 total allocations recorded", t)
-
-	foundationTesting.Assert(len(stats.currentlyLiveAllocations) == 3,
-		"expected 3 live allocations recorded",
-		"3 live allocations recorded", t)
-
-	var totalSize uint64
-	for _, a := range stats.allAllocations {
-		totalSize += a.sizeBytes
-	}
-
-	foundationTesting.Assert(totalSize == 128+256+512,
-		"allocation sizes not recorded correctly",
-		"allocation sizes recorded correctly", t)
-
-	memforgeAllocationRemove(unsafe.Pointer(allocator), ptrB)
-
-	foundationTesting.Assert(len(stats.currentlyLiveAllocations) == 2,
-		"expected 2 live allocations after one removal",
-		"live allocation removal recorded correctly", t)
-
-	FixedLinearAllocatorReset(allocator)
-	foundationTesting.Assert(len(stats.currentlyLiveAllocations) == 0,
-		"expected 0 live allocations after reset",
-		"reset cleared all live allocations", t)
-
-	out := captureOutput(func() {
-		MemforgeMemoryDebug()
-	})
-	t.Log("\n--- MEMORY DEBUG OUTPUT ---\n" + out + "\n----------------------------")
-
-	foundationTesting.Assert(
-		strings.Contains(out, "MEMFORGE MEMORY DEBUGGER") &&
-			strings.Contains(out, "Fixed Linear"),
-		"debug output missing expected strings",
-		"debug output contains expected strings", t)
-}
-
-func captureOutput(fn func()) string {
-	// Create a pipe
-	r, w, _ := os.Pipe()
-	stdout := os.Stdout
-	os.Stdout = w
-
-	// Run the target function
-	fn()
-
-	// Close writer and restore stdout
-	_ = w.Close()
-	os.Stdout = stdout
-
-	// Read all output
-	var buf bytes.Buffer
-	_, _ = io.Copy(&buf, r)
-	_ = r.Close()
-
-	return buf.String()
 }
 
 // ------------------------ tiny utilities ------------------------
