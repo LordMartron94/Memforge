@@ -60,7 +60,7 @@ func SlabAllocatorCreate[T any](capacity uint64) *FixedSlabAllocator[T] {
 	objectAlign := memcore.AlignOf[T]()
 	slotSize := alignIdxUp(objectSize, objectAlign)
 
-	return &FixedSlabAllocator[T]{
+	allocator := &FixedSlabAllocator[T]{
 		storage:       mmap,
 		freeStack:     freeStack,
 		metaAllocator: metaAllocator,
@@ -69,6 +69,10 @@ func SlabAllocatorCreate[T any](capacity uint64) *FixedSlabAllocator[T] {
 		base:          uintptr(unsafe.Pointer(&mmap[0])),
 		destroyed:     false,
 	}
+
+	memforgeAllocatorRegister(unsafe.Pointer(allocator), "Slab")
+
+	return allocator
 }
 
 // SlabAllocatorDestroy destroys the allocator and cleans up.
@@ -76,6 +80,7 @@ func SlabAllocatorCreate[T any](capacity uint64) *FixedSlabAllocator[T] {
 func SlabAllocatorDestroy[T any](instance *FixedSlabAllocator[T]) {
 	memcore.MemmapUnmap(instance.storage)
 	FixedLinearAllocatorDestroy(instance.metaAllocator)
+	memforgeAllocatorRemoveAll(unsafe.Pointer(instance))
 
 	instance.storage = nil
 	instance.metaAllocator = nil
@@ -88,6 +93,7 @@ func SlabAllocatorDestroy[T any](instance *FixedSlabAllocator[T]) {
 func SlabAllocatorReset[T any](instance *FixedSlabAllocator[T]) {
 	slabAllocatorNotDestroyedGuarantee(instance)
 	primitives.StackClear(instance.freeStack)
+	memforgeAllocatorRemoveAll(unsafe.Pointer(instance))
 
 	for i := instance.slotCapacity; i > 0; i-- {
 		primitives.StackPushUnsafe(instance.freeStack, i-1)
@@ -108,6 +114,7 @@ func SlabAllocatorMalloc[T any](instance *FixedSlabAllocator[T]) unsafe.Pointer 
 	}
 
 	addr := unsafe.Add(unsafe.Pointer(instance.base), idx*instance.slotSize)
+	memforgeAllocationAdd(unsafe.Pointer(instance), addr, instance.slotSize)
 	return addr
 }
 
@@ -125,6 +132,7 @@ func SlabAllocatorCalloc[T any](instance *FixedSlabAllocator[T]) unsafe.Pointer 
 	}
 
 	addr := unsafe.Add(unsafe.Pointer(instance.base), idx*instance.slotSize)
+	memforgeAllocationAdd(unsafe.Pointer(instance), addr, instance.slotSize)
 	memcore.MemoryClearNoHeapPointers(addr, uintptr(instance.slotSize))
 	return addr
 }

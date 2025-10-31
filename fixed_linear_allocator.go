@@ -37,18 +37,23 @@ func FixedLinearAllocatorCreate(sizeBytes int) *FixedLinearAllocator {
 		panic(fmt.Errorf("failure to create linear allocator: %w", err))
 	}
 
-	return &FixedLinearAllocator{
+	allocator := &FixedLinearAllocator{
 		storage:   mmap,
 		idx:       0,
 		cap:       (uint64)(sizeBytes),
 		destroyed: false,
 	}
+
+	memforgeAllocatorRegister(unsafe.Pointer(allocator), "Fixed Linear")
+
+	return allocator
 }
 
 // FixedLinearAllocatorDestroy destroys the allocator and cleans up.
 // Do NOT use the allocator anymore.
 func FixedLinearAllocatorDestroy(allocator *FixedLinearAllocator) {
 	memcore.MemmapUnmap(allocator.storage)
+	memforgeAllocatorRemoveAll(unsafe.Pointer(allocator))
 	*allocator = FixedLinearAllocator{destroyed: true}
 }
 
@@ -69,6 +74,7 @@ func FixedLinearAllocatorMalloc(instance *FixedLinearAllocator, sizeBytes, align
 	}
 
 	ptr := unsafe.Pointer(&instance.storage[alignedIdx])
+	memforgeAllocationAdd(unsafe.Pointer(instance), ptr, sizeBytes)
 	instance.idx = alignedIdx + sizeBytes
 
 	return ptr
@@ -89,6 +95,7 @@ func FixedLinearAllocatorMallocUnsafe(instance *FixedLinearAllocator, sizeBytes,
 	}
 
 	ptr := unsafe.Pointer(&instance.storage[alignedIdx])
+	memforgeAllocationAdd(unsafe.Pointer(instance), ptr, sizeBytes)
 	instance.idx = alignedIdx + sizeBytes
 
 	return ptr
@@ -138,6 +145,7 @@ func FixedLinearAllocatorCallocObject[T any](instance *FixedLinearAllocator) *T 
 // Using pointers created before resetting results in undefined behaviour.
 func FixedLinearAllocatorReset(instance *FixedLinearAllocator) {
 	fixedLinearAllocatorNotDestroyedGuarantee(instance)
+	memforgeAllocatorRemoveAll(unsafe.Pointer(instance))
 
 	instance.idx = 0
 }

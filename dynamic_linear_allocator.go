@@ -51,7 +51,7 @@ func DynamicLinearAllocatorCreate(initialCapacityBytes uint, growthStrategy Grow
 		panic("a grow strategy must be provided; if your intent was to have a fixed allocator, use the fixed linear allocator")
 	}
 
-	return &DynamicLinearAllocator{
+	allocator := &DynamicLinearAllocator{
 		storage:        mmap,
 		baseAddr:       uintptr(unsafe.Pointer(&mmap[0])),
 		cap:            (uint64)(initialCapacityBytes),
@@ -59,12 +59,17 @@ func DynamicLinearAllocatorCreate(initialCapacityBytes uint, growthStrategy Grow
 		growthStrategy: growStrat,
 		destroyed:      false,
 	}
+
+	memforgeAllocatorRegister(unsafe.Pointer(allocator), "Dynamic Linear")
+
+	return allocator
 }
 
 // DynamicLinearAllocatorDestroy destroys the allocator and cleans up.
 // Do NOT use the allocator anymore.
 func DynamicLinearAllocatorDestroy(allocator *DynamicLinearAllocator) {
 	memcore.MemmapUnmap(allocator.storage)
+	memforgeAllocatorRemoveAll(unsafe.Pointer(allocator))
 	*allocator = DynamicLinearAllocator{destroyed: true}
 }
 
@@ -85,6 +90,7 @@ func DynamicLinearAllocatorMalloc(instance *DynamicLinearAllocator, sizeBytes, a
 	}
 
 	ptr := unsafe.Pointer(&instance.storage[alignedIdx])
+	memforgeAllocationAdd(unsafe.Pointer(instance), ptr, sizeBytes)
 	addr := uintptr(ptr)
 	relativeAddr := addr - instance.baseAddr
 
@@ -110,6 +116,7 @@ func DynamicLinearAllocatorMallocUnsafe(instance *DynamicLinearAllocator, sizeBy
 	}
 
 	ptr := unsafe.Pointer(&instance.storage[alignedIdx])
+	memforgeAllocationAdd(unsafe.Pointer(instance), ptr, sizeBytes)
 	addr := uintptr(ptr)
 	relativeAddr := addr - instance.baseAddr
 
@@ -188,6 +195,7 @@ func DynamicLinearAllocatorRealPointerRetrieve(instance *DynamicLinearAllocator,
 // Using pointers created before resetting results in undefined behaviour.
 func DynamicLinearAllocatorReset(instance *DynamicLinearAllocator) {
 	dynamicLinearAllocatorNotDestroyedGuarantee(instance)
+	memforgeAllocatorRemoveAll(unsafe.Pointer(instance))
 
 	instance.idx = 0
 }

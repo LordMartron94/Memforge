@@ -92,7 +92,7 @@ func FixedManualAllocatorCreate(sizeBytes uint) *FixedManualAllocator {
 	})
 
 	// --- Finalize allocator ---
-	return &FixedManualAllocator{
+	allocator := &FixedManualAllocator{
 		storage:               mmap,
 		metadataAllocator:     metadataAllocator,
 		cap:                   uint64(sizeBytes),
@@ -102,6 +102,9 @@ func FixedManualAllocatorCreate(sizeBytes uint) *FixedManualAllocator {
 		regionIdxAreaHint:     0,
 		regionIdxFailureCount: 0,
 	}
+
+	memforgeAllocatorRegister(unsafe.Pointer(allocator), "Fixed Manual")
+	return allocator
 }
 
 // FixedManualAllocatorDestroy releases all resources used by the allocator.
@@ -112,6 +115,7 @@ func FixedManualAllocatorDestroy(allocator *FixedManualAllocator) {
 	}
 	memcore.MemmapUnmap(allocator.storage)
 	memcore.MemmapUnmap(allocator.metadataAllocator.storage)
+	memforgeAllocatorRemoveAll(unsafe.Pointer(allocator))
 	allocator.freeMemory = nil
 	allocator.ptrRefs = nil
 	allocator.metadataAllocator = nil
@@ -138,6 +142,7 @@ func FixedManualAllocatorMalloc(instance *FixedManualAllocator, sizeBytes uint64
 	updateFreeListAfterAllocation(instance, regionIdx, alignedIdx, sizeBytes, spaceBefore, spaceAfter)
 
 	ptr := unsafe.Pointer(&instance.storage[alignedIdx])
+	memforgeAllocationAdd(unsafe.Pointer(instance), ptr, sizeBytes)
 	insertPtrRecord(instance, ptr, alignedIdx, sizeBytes)
 	return ptr
 }
@@ -157,6 +162,7 @@ func FixedManualAllocatorMallocUnsafe(instance *FixedManualAllocator, sizeBytes 
 	updateFreeListAfterAllocation(instance, regionIdx, alignedIdx, sizeBytes, spaceBefore, spaceAfter)
 
 	ptr := unsafe.Pointer(&instance.storage[alignedIdx])
+	memforgeAllocationAdd(unsafe.Pointer(instance), ptr, sizeBytes)
 	insertPtrRecord(instance, ptr, alignedIdx, sizeBytes)
 	return ptr
 }
@@ -209,6 +215,7 @@ func FixedManualAllocatorFree(instance *FixedManualAllocator, ptr unsafe.Pointer
 
 	fixedManualAllocatorMergeOrInsert(instance, ptrRef, prevIdx, nextIdx)
 	primitives.FixedOrderedListDeleteUnsafe(instance.ptrRefs, refIdx)
+	memforgeAllocationRemove(unsafe.Pointer(instance), ptr)
 }
 
 // FixedManualAllocatorReset clears all allocations, making the entire memory region
@@ -224,6 +231,7 @@ func FixedManualAllocatorReset(instance *FixedManualAllocator) {
 		sizeBytes:   instance.cap,
 	})
 	instance.regionIdxAreaHint = 0
+	memforgeAllocatorRemoveAll(unsafe.Pointer(instance))
 }
 
 // ---------------------------------- PRIVATE HELPERS ----------------------------------

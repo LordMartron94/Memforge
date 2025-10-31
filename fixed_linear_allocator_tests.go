@@ -1,7 +1,11 @@
 package memforge
 
 import (
-	commontesting "foundation/testing"
+	"bytes"
+	foundationTesting "foundation/testing"
+	"io"
+	"os"
+	"strings"
 	"testing"
 	"unsafe"
 )
@@ -24,9 +28,9 @@ func TestLinearAllocator(t *testing.T) {
 func testCreateAndDestroy(t *testing.T) {
 	const sz = 4096
 	a := FixedLinearAllocatorCreate(sz)
-	commontesting.Assert(a != nil, "allocator is nil after create", "allocator created", t)
+	foundationTesting.Assert(a != nil, "allocator is nil after create", "allocator created", t)
 	FixedLinearAllocatorDestroy(a)
-	commontesting.Assert(true, "destroy should not panic by itself", "allocator destroyed", t)
+	foundationTesting.Assert(true, "destroy should not panic by itself", "allocator destroyed", t)
 }
 
 func testMallocAlignmentAndBump(t *testing.T) {
@@ -36,19 +40,19 @@ func testMallocAlignmentAndBump(t *testing.T) {
 
 	// 1) Basic alignment check
 	p1 := FixedLinearAllocatorMalloc(a, 24, 8)
-	commontesting.Assert(uintptr(p1)%8 == 0, "p1 not 8-byte aligned", "p1 aligned to 8", t)
+	foundationTesting.Assert(uintptr(p1)%8 == 0, "p1 not 8-byte aligned", "p1 aligned to 8", t)
 
 	// 2) Next allocation with stricter alignment
 	p2 := FixedLinearAllocatorMalloc(a, 32, 16)
-	commontesting.Assert(uintptr(p2)%16 == 0, "p2 not 16-byte aligned", "p2 aligned to 16", t)
+	foundationTesting.Assert(uintptr(p2)%16 == 0, "p2 not 16-byte aligned", "p2 aligned to 16", t)
 
 	// 3) Ensure non-overlap: write to both regions and verify they keep values
 	s1 := unsafe.Slice((*byte)(p1), 24)
 	s2 := unsafe.Slice((*byte)(p2), 32)
 	fillBytes(s1, 0xAA)
 	fillBytes(s2, 0xBB)
-	commontesting.Assert(allEqual(s1, 0xAA), "s1 contents corrupted or overlap", "s1 preserved", t)
-	commontesting.Assert(allEqual(s2, 0xBB), "s2 contents corrupted or overlap", "s2 preserved", t)
+	foundationTesting.Assert(allEqual(s1, 0xAA), "s1 contents corrupted or overlap", "s1 preserved", t)
+	foundationTesting.Assert(allEqual(s2, 0xBB), "s2 contents corrupted or overlap", "s2 preserved", t)
 }
 
 func testCapacityExhaustionPanics(t *testing.T) {
@@ -71,16 +75,16 @@ func testZeroSizeAllocationNoBump(t *testing.T) {
 
 	// First, do a zero-sized allocation with alignment 64
 	p0 := FixedLinearAllocatorMalloc(a, 0, 64)
-	commontesting.Assert(uintptr(p0)%64 == 0, "p0 not 64-byte aligned", "p0 aligned to 64", t)
+	foundationTesting.Assert(uintptr(p0)%64 == 0, "p0 not 64-byte aligned", "p0 aligned to 64", t)
 
 	// Another zero-sized allocation with same alignment should return same pointer (no bump)
 	p0b := FixedLinearAllocatorMalloc(a, 0, 64)
-	commontesting.Assert(p0 == p0b, "zero-size allocation bumped index", "zero-size did not bump", t)
+	foundationTesting.Assert(p0 == p0b, "zero-size allocation bumped index", "zero-size did not bump", t)
 
 	// Now do a real allocation with same alignment and ensure it returns the same place,
 	// since idx should not have moved yet.
 	pReal := FixedLinearAllocatorMalloc(a, 32, 64)
-	commontesting.Assert(pReal == p0, "real alloc after zero-size did not start at same aligned position", "real alloc reused aligned pos", t)
+	foundationTesting.Assert(pReal == p0, "real alloc after zero-size did not start at same aligned position", "real alloc reused aligned pos", t)
 }
 
 func testCallocZeroes(t *testing.T) {
@@ -91,11 +95,11 @@ func testCallocZeroes(t *testing.T) {
 	const n = 128
 	p := FixedLinearAllocatorCalloc(a, n, 8)
 	b := unsafe.Slice((*byte)(p), n)
-	commontesting.Assert(allEqual(b, 0x00), "calloc memory not zeroed", "calloc memory zeroed", t)
+	foundationTesting.Assert(allEqual(b, 0x00), "calloc memory not zeroed", "calloc memory zeroed", t)
 
 	// Write and ensure values stick
 	fillBytes(b, 0x5A)
-	commontesting.Assert(allEqual(b, 0x5A), "write to calloc region failed", "write to calloc region ok", t)
+	foundationTesting.Assert(allEqual(b, 0x5A), "write to calloc region failed", "write to calloc region ok", t)
 }
 
 func testResetAllowsReuse(t *testing.T) {
@@ -110,7 +114,7 @@ func testResetAllowsReuse(t *testing.T) {
 	// Reset and allocate same as first — should return same aligned pointer
 	FixedLinearAllocatorReset(a)
 	p1b := FixedLinearAllocatorMalloc(a, 64, 32)
-	commontesting.Assert(p1 == p1b, "first pointer after reset differs; allocator did not reuse from start", "reset reused from start", t)
+	foundationTesting.Assert(p1 == p1b, "first pointer after reset differs; allocator did not reuse from start", "reset reused from start", t)
 }
 
 func testInvalidAlignmentPanics(t *testing.T) {
@@ -146,18 +150,18 @@ func testMallocAndCallocObject(t *testing.T) {
 	obj.C = 0xCCDD
 	obj.D = 0x7F
 
-	commontesting.Assert(obj.A == 0xDEADBEEFCAFEBABE, "obj.A mismatch", "obj.A ok", t)
-	commontesting.Assert(obj.B == 0xA1B2C3D4, "obj.B mismatch", "obj.B ok", t)
-	commontesting.Assert(obj.C == 0xCCDD, "obj.C mismatch", "obj.C ok", t)
-	commontesting.Assert(obj.D == 0x7F, "obj.D mismatch", "obj.D ok", t)
+	foundationTesting.Assert(obj.A == 0xDEADBEEFCAFEBABE, "obj.A mismatch", "obj.A ok", t)
+	foundationTesting.Assert(obj.B == 0xA1B2C3D4, "obj.B mismatch", "obj.B ok", t)
+	foundationTesting.Assert(obj.C == 0xCCDD, "obj.C mismatch", "obj.C ok", t)
+	foundationTesting.Assert(obj.D == 0x7F, "obj.D mismatch", "obj.D ok", t)
 
 	// CallocObject: zeroed
 	obj2 := FixedLinearAllocatorCallocObject[pod](a)
-	commontesting.Assert(obj2.A == 0 && obj2.B == 0 && obj2.C == 0 && obj2.D == 0,
+	foundationTesting.Assert(obj2.A == 0 && obj2.B == 0 && obj2.C == 0 && obj2.D == 0,
 		"calloc object not zero-initialized", "calloc object zero-initialized", t)
 
 	// Ensure distinct objects (different addresses)
-	commontesting.Assert(obj != obj2, "MallocObject and CallocObject returned same address", "distinct objects", t)
+	foundationTesting.Assert(obj != obj2, "MallocObject and CallocObject returned same address", "distinct objects", t)
 }
 
 func testUseAfterDestroyPanics(t *testing.T) {
@@ -170,6 +174,86 @@ func testUseAfterDestroyPanics(t *testing.T) {
 	mustPanic(t, func() { _ = FixedLinearAllocatorCalloc(a, 16, 8) })
 }
 
+func TestMemforgeDebuggerFixedLinear(t *testing.T) {
+	const arenaSize = 1024 * 1024 // 1 MiB
+	allocator := FixedLinearAllocatorCreate(arenaSize)
+	defer FixedLinearAllocatorDestroy(allocator)
+
+	ptrA := FixedLinearAllocatorMalloc(allocator, 128, 16)
+	ptrB := FixedLinearAllocatorMalloc(allocator, 256, 16)
+	ptrC := FixedLinearAllocatorMalloc(allocator, 512, 16)
+
+	foundationTesting.Assert(ptrA != nil && ptrB != nil && ptrC != nil,
+		"allocator returned nil pointers",
+		"allocator returned non-nil pointers", t)
+
+	stats := debugStats[uintptr(unsafe.Pointer(allocator))]
+
+	foundationTesting.Assert(stats.allocatorName == "Fixed Linear",
+		"allocator name not correctly registered",
+		"allocator name correctly registered", t)
+
+	foundationTesting.Assert(len(stats.allAllocations) == 3,
+		"expected 3 total allocations recorded",
+		"3 total allocations recorded", t)
+
+	foundationTesting.Assert(len(stats.currentlyLiveAllocations) == 3,
+		"expected 3 live allocations recorded",
+		"3 live allocations recorded", t)
+
+	var totalSize uint64
+	for _, a := range stats.allAllocations {
+		totalSize += a.sizeBytes
+	}
+
+	foundationTesting.Assert(totalSize == 128+256+512,
+		"allocation sizes not recorded correctly",
+		"allocation sizes recorded correctly", t)
+
+	memforgeAllocationRemove(unsafe.Pointer(allocator), ptrB)
+
+	foundationTesting.Assert(len(stats.currentlyLiveAllocations) == 2,
+		"expected 2 live allocations after one removal",
+		"live allocation removal recorded correctly", t)
+
+	FixedLinearAllocatorReset(allocator)
+	foundationTesting.Assert(len(stats.currentlyLiveAllocations) == 0,
+		"expected 0 live allocations after reset",
+		"reset cleared all live allocations", t)
+
+	out := captureOutput(func() {
+		MemforgeMemoryDebug()
+	})
+	t.Log("\n--- MEMORY DEBUG OUTPUT ---\n" + out + "\n----------------------------")
+
+	foundationTesting.Assert(
+		strings.Contains(out, "MEMFORGE MEMORY DEBUGGER") &&
+			strings.Contains(out, "Fixed Linear"),
+		"debug output missing expected strings",
+		"debug output contains expected strings", t)
+}
+
+func captureOutput(fn func()) string {
+	// Create a pipe
+	r, w, _ := os.Pipe()
+	stdout := os.Stdout
+	os.Stdout = w
+
+	// Run the target function
+	fn()
+
+	// Close writer and restore stdout
+	_ = w.Close()
+	os.Stdout = stdout
+
+	// Read all output
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	_ = r.Close()
+
+	return buf.String()
+}
+
 // ------------------------ tiny utilities ------------------------
 
 func mustPanic(t *testing.T, fn func()) {
@@ -178,7 +262,7 @@ func mustPanic(t *testing.T, fn func()) {
 		if r := recover(); r != nil {
 			didPanic = true
 		}
-		commontesting.Assert(
+		foundationTesting.Assert(
 			didPanic,
 			"expected panic but none occurred",
 			"panic occurred as expected",
