@@ -171,25 +171,21 @@ func SlabAllocatorCallocUnsafe[T any](allocator memcore.Pointer) memcore.Pointer
 // Convenience wrappers (typed access)
 // They only exist for ergonomic access in Go code, and never store Go pointers.
 
-//go:nosplit
 func SlabAllocatorMallocObject[T any](allocator memcore.Pointer) *T {
 	ptr := SlabAllocatorMalloc[T](allocator)
 	return memcore.MemcorePointerDereferenceObjectUnsafe[T](ptr)
 }
 
-//go:nosplit
 func SlabAllocatorCallocObject[T any](allocator memcore.Pointer) *T {
 	ptr := SlabAllocatorCalloc[T](allocator)
 	return memcore.MemcorePointerDereferenceObjectUnsafe[T](ptr)
 }
 
-//go:nosplit
 func SlabAllocatorMallocObjectUnsafe[T any](allocator memcore.Pointer) *T {
 	ptr := SlabAllocatorMallocUnsafe[T](allocator)
 	return memcore.MemcorePointerDereferenceObjectUnsafe[T](ptr)
 }
 
-//go:nosplit
 func SlabAllocatorCallocObjectUnsafe[T any](allocator memcore.Pointer) *T {
 	ptr := SlabAllocatorCallocUnsafe[T](allocator)
 	return memcore.MemcorePointerDereferenceObjectUnsafe[T](ptr)

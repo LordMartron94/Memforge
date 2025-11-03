@@ -130,8 +130,6 @@ func FixedLinearAllocatorMallocUnsafe(allocator memcore.Pointer, sizeBytes, alig
 }
 
 // FixedLinearAllocatorCalloc allocates and zeroes memory.
-//
-//go:nosplit
 func FixedLinearAllocatorCalloc(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
 	ptr := FixedLinearAllocatorMalloc(allocator, sizeBytes, alignment)
 	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(sizeBytes))
@@ -149,8 +147,6 @@ func FixedLinearAllocatorCallocUnsafe(allocator memcore.Pointer, sizeBytes, alig
 
 // FixedLinearAllocatorMallocObject allocates and returns a typed object.
 // It returns a memcore.Pointer to the object, properly aligned.
-//
-//go:nosplit
 func FixedLinearAllocatorMallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
@@ -161,8 +157,6 @@ func FixedLinearAllocatorMallocObject[T any](allocator memcore.Pointer) memcore.
 
 // FixedLinearAllocatorCallocObject allocates a zeroed typed object.
 // It returns a memcore.Pointer to the object.
-//
-//go:nosplit
 func FixedLinearAllocatorCallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()

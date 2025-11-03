@@ -199,8 +199,6 @@ func FixedManualAllocatorCallocUnsafe(allocator memcore.Pointer, sizeBytes, alig
 
 // FixedManualAllocatorMallocObject allocates and returns a typed object.
 // It returns a memcore.Pointer to the object, properly aligned.
-//
-//go:nosplit
 func FixedManualAllocatorMallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
@@ -211,8 +209,6 @@ func FixedManualAllocatorMallocObject[T any](allocator memcore.Pointer) memcore.
 
 // FixedManualAllocatorCallocObject allocates a zeroed typed object.
 // It returns a memcore.Pointer to the object.
-//
-//go:nosplit
 func FixedManualAllocatorCallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
@@ -287,7 +283,7 @@ func fixedManualAllocatorFindRef(a *FixedManualAllocator, target memcore.Pointer
 		}
 	})
 	if err != nil {
-		panic("manual allocator: unknown pointer")
+		panic(fmt.Errorf("manual allocator: unknown pointer: %s", target))
 	}
 	return primitives.FixedOrderedListItemPtrGetAtUnsafe[allocationRecord](a.ptrRefs, refIdx), refIdx
 }

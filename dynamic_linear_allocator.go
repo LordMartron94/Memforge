@@ -21,18 +21,14 @@ type DynamicLinearAllocator struct {
 	dataCapBytes       uint64
 	dataByteIdx        uint64
 
-	growthStrategy GrowthStrategy
+	growthStrategyID memcore.FunctionID
 }
 
 // DynamicLinearAllocatorCreate creates a new dynamic allocator in its own mmap region.
 //
 // It allocates both the header and initial arena contiguously and registers a namespace
 // for all pointers allocated within. The returned memcore.Pointer refers to the allocator header.
-func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategy GrowthStrategy) memcore.Pointer {
-	if growthStrategy == nil {
-		panic("DynamicLinearAllocatorCreate: a growth strategy must be provided")
-	}
-
+func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategy memcore.FunctionID) memcore.Pointer {
 	headerSize := memcore.SizeOf[DynamicLinearAllocator]()
 	headerAlignedSize := alignIdxUp(headerSize, uint64(allocatorDataAddrAlignment))
 
@@ -57,7 +53,7 @@ func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategy Gr
 		allocatorTotalSize: totalSize,
 		dataCapBytes:       initialCapacityBytes,
 		dataByteIdx:        0,
-		growthStrategy:     growthStrategy,
+		growthStrategyID:   growthStrategy,
 	}
 
 	memforgeAllocatorRegister(allocatorPtr, "Dynamic Linear (Manual)")
@@ -87,8 +83,8 @@ func DynamicLinearAllocatorMalloc(allocator memcore.Pointer, sizeBytes, alignmen
 	alignmentValidate(alignment)
 
 	alignedIdx := dynamicLinearAllocatorDataIdxGet(header, alignment)
-	if !capacityGuarantee(alignedIdx, header.dataCapBytes, sizeBytes) {
-		dynamicLinearAllocatorGrow(header, alignedIdx+sizeBytes)
+	if !dynamicLinearAllocatorCapacityGuarantee(header, sizeBytes, alignedIdx) {
+		header = dynamicLinearAllocatorGrow(header, alignedIdx+sizeBytes)
 	}
 
 	offset := uintptr(alignedIdx)
@@ -107,8 +103,8 @@ func DynamicLinearAllocatorMallocUnsafe(allocator memcore.Pointer, sizeBytes, al
 	header := memcore.MemcorePointerDereferenceObjectUnsafe[DynamicLinearAllocator](allocator)
 
 	alignedIdx := dynamicLinearAllocatorDataIdxGet(header, alignment)
-	if !capacityGuarantee(alignedIdx, header.dataCapBytes, sizeBytes) {
-		dynamicLinearAllocatorGrow(header, alignedIdx+sizeBytes)
+	if !dynamicLinearAllocatorCapacityGuarantee(header, sizeBytes, alignedIdx) {
+		header = dynamicLinearAllocatorGrow(header, alignedIdx+sizeBytes)
 	}
 
 	offset := uintptr(alignedIdx)
@@ -139,8 +135,6 @@ func DynamicLinearAllocatorCallocUnsafe(allocator memcore.Pointer, sizeBytes, al
 }
 
 // DynamicLinearAllocatorMallocObject allocates a typed object.
-//
-//go:nosplit
 func DynamicLinearAllocatorMallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
@@ -150,8 +144,6 @@ func DynamicLinearAllocatorMallocObject[T any](allocator memcore.Pointer) memcor
 }
 
 // DynamicLinearAllocatorCallocObject allocates a zeroed typed object.
-//
-//go:nosplit
 func DynamicLinearAllocatorCallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
@@ -174,27 +166,40 @@ func DynamicLinearAllocatorReset(allocator memcore.Pointer) {
 // -------------------------- PRIVATE HELPERS --------------------------
 
 //go:inline
-func dynamicLinearAllocatorGrow(header *DynamicLinearAllocator, neededCapacityBytes uint64) {
-	newSize := header.growthStrategy(header.dataCapBytes, neededCapacityBytes)
+func dynamicLinearAllocatorGrow(header *DynamicLinearAllocator, neededCapacityBytes uint64) *DynamicLinearAllocator {
+	prev := *header
+
+	strategy := memcore.MemcoreFunctionGetTyped[GrowthStrategy](prev.growthStrategyID)
+	newSize := strategy(prev.dataCapBytes, neededCapacityBytes)
 	if newSize < neededCapacityBytes {
 		panic("growth strategy returned invalid new size")
 	}
 
+	oldTotal := prev.allocatorTotalSize
+	oldBase := unsafe.Pointer(prev.allocatorAddr)
+
+	newTotal := memcore.SizeOf[DynamicLinearAllocator]() + newSize
+
 	newMap, err := memcore.MemmapRemapAt(
-		unsafe.Pointer(header.allocatorAddr),
-		int(header.dataCapBytes+memcore.SizeOf[DynamicLinearAllocator]()),
-		int(newSize+memcore.SizeOf[DynamicLinearAllocator]()),
+		oldBase,
+		int(oldTotal),
+		int(newTotal),
 		memcore.MREMAP_MAYMOVE,
 	)
 	if err != nil {
 		panic(fmt.Errorf("dynamic allocator: could not grow memory: %w", err))
 	}
 
-	header.allocatorAddr = uintptr(unsafe.Pointer(&newMap[0]))
-	header.dataCapBytes = newSize
+	newBaseAddr := uintptr(unsafe.Pointer(&newMap[0]))
+	newHeaderPtr := (*DynamicLinearAllocator)(unsafe.Pointer(newBaseAddr))
 
-	// Reflect updated base address in the namespace mapping
-	memcore.MemcorePointerBaseAddressUpdate(header.namespace, header.allocatorAddr)
+	*newHeaderPtr = prev
+	newHeaderPtr.allocatorAddr = newBaseAddr
+	newHeaderPtr.allocatorTotalSize = newTotal
+	newHeaderPtr.dataCapBytes = newSize
+
+	memcore.MemcorePointerBaseAddressUpdate(newHeaderPtr.namespace, newBaseAddr)
+	return newHeaderPtr
 }
 
 //go:inline
