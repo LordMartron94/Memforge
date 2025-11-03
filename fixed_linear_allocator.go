@@ -1,3 +1,4 @@
+// Package memforge provides low-level manual memory allocators built on top of memcore.
 package memforge
 
 import (
@@ -6,152 +7,197 @@ import (
 	"unsafe"
 )
 
-// FixedLinearAllocator is a fixed-size bump allocator.
-// Blazingly fast, but not as flexible.
-// NOT thread-safe -- it does not just non-block, it is unsafe to call concurrently.
+// FixedLinearAllocator is a fixed-size bump allocator built entirely on top of memcore.Pointer.
+//
+// The allocator maintains a namespace containing:
+//   - Its own header (this struct)
+//   - A contiguous memory region (the arena)
+//
+// It is blazingly fast (O(1) per allocation) but not thread-safe.
+// The allocator does not perform bounds tracking beyond simple linear capacity checks.
+//
+// ⚠️ Do NOT store Go pointers inside manually allocated memory returned by this allocator.
 type FixedLinearAllocator struct {
-	storage   memcore.MemoryMap
-	idx       uint64
-	cap       uint64
-	destroyed bool
+	allocatorAddr      uintptr
+	allocatorTotalSize uint64
+	dataBaseOffset     uintptr
+	namespace          uint32
+	dataByteIdx        uint64
+	dataCapBytes       uint64
 }
 
-// FixedLinearAllocatorCreate creates an instance of the linear allocator.
+// FixedLinearAllocatorCreate creates a FixedLinearAllocator within its own mmap region.
+// Both the header and its managed memory live in the same mapped space.
 //
-// ⚠️ Important: Do NOT allocate this struct itself inside manually-managed memory.
-// The struct contains Go pointers and must remain
-// visible to the Go garbage collector.
-//
-// You may, however, point its internal data (the `ptr` field) to memory that was
-// manually allocated (e.g. via mmap or a custom allocator). In other words:
-//
-//	✅ Safe:   header on Go heap, data in manual memory
-//	❌ Unsafe: header and data both in manual memory
-func FixedLinearAllocatorCreate(sizeBytes int) *FixedLinearAllocator {
-	mmap, err := memcore.MemmapRequest(sizeBytes, memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
+// The allocator automatically registers a namespace for all future allocations.
+// On success, it returns a `memcore.Pointer` to the allocator header itself.
+func FixedLinearAllocatorCreate(sizeBytes int) memcore.Pointer {
+	headerSize := memcore.SizeOf[FixedLinearAllocator]()
+	headerAlignedSize := alignIdxUp(uint64(headerSize), uint64(allocatorDataAddrAlignment))
 
+	totalSize := headerAlignedSize + uint64(sizeBytes)
+
+	mmap, err := memcore.MemmapRequest(int(totalSize), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
 	if err != nil {
-		panic(fmt.Errorf("failure to create linear allocator: %w", err))
+		panic(fmt.Errorf("failed to create linear allocator: %w", err))
 	}
 
-	allocator := &FixedLinearAllocator{
-		storage:   mmap,
-		idx:       0,
-		cap:       (uint64)(sizeBytes),
-		destroyed: false,
+	allocatorPtrRaw := unsafe.Pointer(&mmap[0])
+	allocatorAddr := uintptr(allocatorPtrRaw)
+
+	addressSpace := memcore.MemcoreAddressSpaceRegister(allocatorAddr)
+
+	allocatorPtr := memcore.MemcorePointerCreate(addressSpace, 0, memcore.TypeOf[FixedLinearAllocator]())
+	memcore.MemcorePointerRegister(allocatorPtr)
+
+	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedLinearAllocator](allocatorPtr)
+	*header = FixedLinearAllocator{
+		allocatorAddr:      allocatorAddr,
+		allocatorTotalSize: totalSize,
+		dataBaseOffset:     uintptr(headerAlignedSize),
+		namespace:          addressSpace,
+		dataByteIdx:        0,
+		dataCapBytes:       uint64(sizeBytes),
 	}
 
-	memforgeAllocatorRegister(unsafe.Pointer(allocator), "Fixed Linear")
+	memforgeAllocatorRegister(allocatorPtr, "Fixed Linear (Manual)")
 
-	return allocator
+	return allocatorPtr
 }
 
-// FixedLinearAllocatorDestroy destroys the allocator and cleans up.
-// Do NOT use the allocator anymore.
-func FixedLinearAllocatorDestroy(allocator *FixedLinearAllocator) {
-	memcore.MemmapUnmap(allocator.storage)
-	memforgeAllocatorDestroy(unsafe.Pointer(allocator))
-	*allocator = FixedLinearAllocator{destroyed: true}
-}
+// FixedLinearAllocatorDestroy unmaps and unregisters the allocator and all its allocations.
+// Do NOT use the allocator after calling this.
+func FixedLinearAllocatorDestroy(allocator memcore.Pointer) {
+	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedLinearAllocator](allocator)
 
-// FixedLinearAllocatorMalloc allocates X amount of bytes from the allocator.
-// It does not zero the memory, therefore it may contain garbage.
-// Storing Go pointers ANYWHERE inside this allocation results in undefined behaviour.
-// Requesting 0 bytes returns an aligned pointer but does not change the allocator state.
-//
-//go:nosplit
-func FixedLinearAllocatorMalloc(instance *FixedLinearAllocator, sizeBytes, alignment uint64) unsafe.Pointer {
-	fixedLinearAllocatorNotDestroyedGuarantee(instance)
-	alignmentValidate(alignment)
+	memforgeAllocatorDestroy(allocator)
 
-	alignedIdx := alignIdxUp(instance.idx, alignment)
+	memcore.MemcoreAddressSpaceUnregister(header.namespace)
 
-	if !capacityGuarantee(alignedIdx, instance.cap, sizeBytes) {
-		panic("cannot allocate more memory than the allocator has available")
+	if err := memcore.MemmapUnmapAt(unsafe.Pointer(header.allocatorAddr), int(header.allocatorTotalSize)); err != nil {
+		panic(fmt.Errorf("failed to destroy allocator: %w", err))
 	}
-
-	ptr := unsafe.Pointer(&instance.storage[alignedIdx])
-	memforgeAllocationAdd(unsafe.Pointer(instance), ptr, sizeBytes)
-	instance.idx = alignedIdx + sizeBytes
-
-	return ptr
 }
-
-// FixedLinearAllocatorMallocUnsafe allocates X amount of bytes from the allocator.
-// It does not zero the memory, therefore it may contain garbage.
-// Storing Go pointers ANYWHERE inside this allocation results in undefined behaviour.
-// Requesting 0 bytes returns an aligned pointer but does not change the allocator state.
-// The unsafe version skips the alignment validation and the existence guarantee for the sake of performance.
-//
-//go:nosplit
-func FixedLinearAllocatorMallocUnsafe(instance *FixedLinearAllocator, sizeBytes, alignment uint64) unsafe.Pointer {
-	alignedIdx := alignIdxUp(instance.idx, alignment)
-
-	if !capacityGuarantee(alignedIdx, instance.cap, sizeBytes) {
-		panic("cannot allocate more memory than the allocator has available")
-	}
-
-	ptr := unsafe.Pointer(&instance.storage[alignedIdx])
-	memforgeAllocationAdd(unsafe.Pointer(instance), ptr, sizeBytes)
-	instance.idx = alignedIdx + sizeBytes
-
-	return ptr
-}
-
-// FixedLinearAllocatorCalloc is similar to FixedLinearAllocatorMalloc, except it also zeroes out the memory.
-// Note: This is quite expensive (especially for larger amounts of memory),
-// so avoid using it if at all possible.
-//
-//go:nosplit
-func FixedLinearAllocatorCalloc(instance *FixedLinearAllocator, sizeBytes, alignment uint64) unsafe.Pointer {
-	ptr := FixedLinearAllocatorMalloc(instance, sizeBytes, alignment)
-	memcore.MemoryClearNoHeapPointers(ptr, uintptr(sizeBytes))
-	return ptr
-}
-
-// FixedLinearAllocatorCallocUnsafe is similar to FixedLinearAllocatorMallocUnsafe, except it also zeroes out the memory.
-// Note: This is quite expensive (especially for larger amounts of memory),
-// so avoid using it if at all possible.
-//
-//go:nosplit
-func FixedLinearAllocatorCallocUnsafe(instance *FixedLinearAllocator, sizeBytes, alignment uint64) unsafe.Pointer {
-	ptr := FixedLinearAllocatorMallocUnsafe(instance, sizeBytes, alignment)
-	memcore.MemoryClearNoHeapPointers(ptr, uintptr(sizeBytes))
-	return ptr
-}
-
-// FixedLinearAllocatorMallocObject is a convenience wrapper around FixedLinearAllocatorMalloc.
-// It converts the allocated memory to the desired object type.
-//
-//go:nosplit
-func FixedLinearAllocatorMallocObject[T any](instance *FixedLinearAllocator) *T {
-	ptr := FixedLinearAllocatorMalloc(instance, memcore.SizeOf[T](), memcore.AlignOf[T]())
-	return (*T)(ptr)
-}
-
-// FixedLinearAllocatorCallocObject is a convenience wrapper around FixedLinearAllocatorCalloc.
-// It converts the allocated memory to the desired object type.
-//
-//go:nosplit
-func FixedLinearAllocatorCallocObject[T any](instance *FixedLinearAllocator) *T {
-	ptr := FixedLinearAllocatorCalloc(instance, memcore.SizeOf[T](), memcore.AlignOf[T]())
-	return (*T)(ptr)
-}
-
-// FixedLinearAllocatorReset sets the index of the allocator to 0, allowing the memory to be re-used.
-// Using pointers created before resetting results in undefined behaviour.
-func FixedLinearAllocatorReset(instance *FixedLinearAllocator) {
-	fixedLinearAllocatorNotDestroyedGuarantee(instance)
-	memforgeAllocatorRemoveAll(unsafe.Pointer(instance))
-
-	instance.idx = 0
-}
-
-// ---------------------------------------- PRIVATE HELPERS
 
 //go:inline
-func fixedLinearAllocatorNotDestroyedGuarantee(instance *FixedLinearAllocator) {
-	if instance.destroyed {
-		panic("cannot use a destroyed allocator")
+func fixedLinearAllocatorOOMError(allocator *FixedLinearAllocator, requestedSize uint64) error {
+	return fmt.Errorf("fixed linear allocator: out of memory, requested: %v, available: %v, current idx: %v, cap: %v", requestedSize, allocator.dataCapBytes-allocator.dataByteIdx, allocator.dataByteIdx, allocator.dataCapBytes)
+}
+
+// FixedLinearAllocatorMalloc allocates `sizeBytes` bytes of memory with the given alignment.
+// Returns a memcore.Pointer inside the allocator's namespace.
+// The memory is not zeroed.
+//
+//go:nosplit
+func FixedLinearAllocatorMalloc(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
+	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedLinearAllocator](allocator)
+	alignmentValidate(alignment)
+
+	alignedIdx := fixedLinearAllocatorDataIdxGet(header, alignment)
+	if !fixedLinearAllocatorCapacityGuarantee(header, sizeBytes, alignedIdx) {
+		panic(fixedLinearAllocatorOOMError(header, sizeBytes))
 	}
+
+	offset := uintptr(alignedIdx)
+	ptr := memcore.MemcorePointerCreate(header.namespace, offset, memcore.TypeOf[byte]())
+	memcore.MemcorePointerRegister(ptr)
+
+	memforgeAllocationAdd(allocator, ptr, sizeBytes)
+
+	fixedLinearAllocatorIdxUpdate(header, alignedIdx, sizeBytes)
+	return ptr
+}
+
+// FixedLinearAllocatorMallocUnsafe allocates memory without validation.
+//
+//go:nosplit
+func FixedLinearAllocatorMallocUnsafe(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
+	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedLinearAllocator](allocator)
+	alignedIdx := fixedLinearAllocatorDataIdxGet(header, alignment)
+
+	if !fixedLinearAllocatorCapacityGuarantee(header, sizeBytes, alignedIdx) {
+		panic(fixedLinearAllocatorOOMError(header, sizeBytes))
+	}
+
+	offset := uintptr(alignedIdx)
+	ptr := memcore.MemcorePointerCreate(header.namespace, offset, memcore.TypeOf[byte]())
+	memcore.MemcorePointerRegister(ptr)
+
+	memforgeAllocationAdd(allocator, ptr, sizeBytes)
+	fixedLinearAllocatorIdxUpdate(header, alignedIdx, sizeBytes)
+
+	return ptr
+}
+
+// FixedLinearAllocatorCalloc allocates and zeroes memory.
+//
+//go:nosplit
+func FixedLinearAllocatorCalloc(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
+	ptr := FixedLinearAllocatorMalloc(allocator, sizeBytes, alignment)
+	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(sizeBytes))
+	return ptr
+}
+
+// FixedLinearAllocatorCallocUnsafe allocates and zeroes memory without validation.
+//
+//go:nosplit
+func FixedLinearAllocatorCallocUnsafe(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
+	ptr := FixedLinearAllocatorMallocUnsafe(allocator, sizeBytes, alignment)
+	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(sizeBytes))
+	return ptr
+}
+
+// FixedLinearAllocatorMallocObject allocates and returns a typed object.
+// It returns a memcore.Pointer to the object, properly aligned.
+//
+//go:nosplit
+func FixedLinearAllocatorMallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
+	size := memcore.SizeOf[T]()
+	align := memcore.AlignOf[T]()
+	ptr := FixedLinearAllocatorMalloc(allocator, size, align)
+	memcore.MemcorePointerUpdateType(ptr, memcore.TypeOf[T]())
+	return ptr
+}
+
+// FixedLinearAllocatorCallocObject allocates a zeroed typed object.
+// It returns a memcore.Pointer to the object.
+//
+//go:nosplit
+func FixedLinearAllocatorCallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
+	size := memcore.SizeOf[T]()
+	align := memcore.AlignOf[T]()
+	ptr := FixedLinearAllocatorCalloc(allocator, size, align)
+	memcore.MemcorePointerUpdateType(ptr, memcore.TypeOf[T]())
+	return ptr
+}
+
+// FixedLinearAllocatorReset resets the allocator’s bump index,
+// allowing the region to be reused.
+//
+// All previously allocated pointers are unregistered.
+// Using them afterward is undefined behaviour.
+func FixedLinearAllocatorReset(allocator memcore.Pointer) {
+	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedLinearAllocator](allocator)
+	memforgeAllocatorRemoveAll(allocator)
+	memcore.MemcoreAddressSpaceClearPointers(header.namespace)
+	memcore.MemcorePointerRegister(allocator)
+
+	header.dataByteIdx = 0
+}
+
+// -------------------------- PRIVATE HELPERS --------------------------
+
+//go:inline
+func fixedLinearAllocatorCapacityGuarantee(header *FixedLinearAllocator, requestedSize, alignedIdx uint64) bool {
+	return capacityGuarantee(alignedIdx, header.dataCapBytes+uint64(header.dataBaseOffset), requestedSize)
+}
+
+//go:inline
+func fixedLinearAllocatorDataIdxGet(header *FixedLinearAllocator, requestedAlignment uint64) uint64 {
+	return alignIdxUp(uint64(header.dataBaseOffset)+header.dataByteIdx, requestedAlignment)
+}
+
+//go:inline
+func fixedLinearAllocatorIdxUpdate(header *FixedLinearAllocator, alignedIdx, sizeBytes uint64) {
+	header.dataByteIdx = (alignedIdx - uint64(header.dataBaseOffset)) + sizeBytes
 }

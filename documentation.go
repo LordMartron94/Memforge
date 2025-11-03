@@ -174,3 +174,9 @@
 // Improper use can crash the program or corrupt memory; treat these tools
 // as unsafe systems-level components.
 package memforge
+
+import "memcore"
+
+func init() {
+	memcore.MemcoreInternalFunctionPrefixAdd("memforge.test")
+}

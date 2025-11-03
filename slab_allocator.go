@@ -7,200 +7,197 @@ import (
 	"unsafe"
 )
 
-// FixedSlabAllocator is a pooled allocator for use with a single object.
-// Super fast, and flexible.
-// Prefer to use this if possible when you must use something other than
-// the fixed linear allocator (as it is still the fastest)
+// FixedSlabAllocator is a pooled allocator for fixed-size objects of type T.
+// All allocations live in a dedicated namespace inside a single mmap region.
+// The allocator itself (the header) must stay on the Go heap.
+//
+// ⚠️ Do NOT store Go pointers inside memory returned by this allocator.
+// ⚠️ Do NOT move the allocator struct itself into manual memory.
 type FixedSlabAllocator[T any] struct {
-	storage   memcore.MemoryMap
-	freeStack *primitives.Stack[uint64]
-
-	metaAllocator *FixedLinearAllocator
-	base          uintptr
-	slotSize      uint64
-	slotCapacity  uint64
-	destroyed     bool
+	allocatorAddr      uintptr // base address of mmap region
+	dataBaseOffset     uintptr
+	allocatorTotalSize uint64
+	namespace          uint32 // namespace for all slab allocations
+	slotSize           uint64 // bytes per slot
+	slotAlignment      uint64
+	slotCapacity       uint64          // number of slots in the slab
+	freeStack          memcore.Pointer // points to Stack[uint64]
+	metaAllocator      memcore.Pointer // points to FixedLinearAllocator
 }
 
-// SlabAllocatorCreate initializes a new slab allocator with a given capacity.
+// SlabAllocatorCreate creates a new slab allocator inside its own mmap region.
 //
-// ⚠️ Important: The allocator struct itself contains Go pointers and must reside on
-// the Go heap, visible to the garbage collector. Do NOT allocate this struct in
-// manually-managed memory.
-//
-// You may, however, point its internal data buffer to a manually managed memory
-// region (e.g., from another allocator or a direct mmap call).
-//
-//   - ✅ Safe:   Allocator struct on Go heap, data buffer in manual memory.
-//   - ❌ Unsafe: Allocator struct and data buffer both in manual memory.
-func SlabAllocatorCreate[T any](capacity uint64) *FixedSlabAllocator[T] {
+// The allocator registers its own namespace. It also creates a metadata allocator
+// (FixedLinearAllocator) that holds the free stack structure.
+func SlabAllocatorCreate[T any](capacity uint64) memcore.Pointer {
 	if capacity == 0 {
-		panic("cannot create slab allocator with capacity of 0")
+		panic("cannot create slab allocator with capacity 0")
 	}
 
-	dataBytes := primitives.ArrayRequiredBytesGet[T](capacity)
-	mmap, err := memcore.MemmapRequest(int(dataBytes), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
+	objSize := memcore.SizeOf[T]()
+	objAlign := memcore.AlignOf[T]()
+	slotSize := alignIdxUp(objSize, objAlign)
+	headerSize := memcore.SizeOf[FixedSlabAllocator[T]]()
+	headerAlignedSize := alignIdxUp(uint64(headerSize), uint64(allocatorDataAddrAlignment))
+	totalBytes := headerAlignedSize + slotSize*capacity
 
+	mmap, err := memcore.MemmapRequest(int(totalBytes), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
 	if err != nil {
-		panic(fmt.Errorf("failure to create slab allocator: %w", err))
+		panic(fmt.Errorf("slab allocator: mmap failed: %w", err))
 	}
 
-	stackBytes := primitives.ArrayRequiredBytesGet[uint64](capacity)
+	allocatorAddr := uintptr(unsafe.Pointer(&mmap[0]))
+	namespace := memcore.MemcoreAddressSpaceRegister(allocatorAddr)
 
-	metaAllocator := FixedLinearAllocatorCreate(int(stackBytes))
-	stackAddr := FixedLinearAllocatorMalloc(metaAllocator, stackBytes, memcore.AlignOf[uint64]())
+	headerPtr := memcore.MemcorePointerCreate(namespace, 0, memcore.TypeOf[FixedSlabAllocator[T]]())
+	memcore.MemcorePointerRegister(headerPtr)
+	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedSlabAllocator[T]](headerPtr)
 
-	freeStack := primitives.StackCreateAt[uint64](stackAddr, capacity)
+	stackBytes := primitives.StackRequiredBytesGet[uint64](capacity)
+	stackAlign := primitives.StackRequiredAlignmentGet[uint64]()
+
+	metaAlloc := FixedLinearAllocatorCreate(int(stackBytes))
+	header.metaAllocator = metaAlloc
+
+	stackPtr := FixedLinearAllocatorMalloc(metaAlloc, stackBytes, stackAlign)
+	memcore.MemcorePointerUpdateType(stackPtr, memcore.TypeOf[primitives.Stack[T]]())
+	primitives.StackInitializeAt[uint64](stackPtr, capacity)
+	header.freeStack = stackPtr
 
 	for i := capacity; i > 0; i-- {
-		primitives.StackPushUnsafe(freeStack, i-1)
+		primitives.StackPushUnsafe(stackPtr, i-1)
 	}
 
-	objectSize := memcore.SizeOf[T]()
-	objectAlign := memcore.AlignOf[T]()
-	slotSize := alignIdxUp(objectSize, objectAlign)
-
-	allocator := &FixedSlabAllocator[T]{
-		storage:       mmap,
-		freeStack:     freeStack,
-		metaAllocator: metaAllocator,
-		slotSize:      slotSize,
-		slotCapacity:  capacity,
-		base:          uintptr(unsafe.Pointer(&mmap[0])),
-		destroyed:     false,
+	// --- Write header
+	*header = FixedSlabAllocator[T]{
+		allocatorAddr:      allocatorAddr,
+		dataBaseOffset:     uintptr(headerAlignedSize),
+		namespace:          namespace,
+		allocatorTotalSize: totalBytes,
+		slotSize:           slotSize,
+		slotAlignment:      memcore.AlignOf[uint64](),
+		slotCapacity:       capacity,
+		freeStack:          stackPtr,
+		metaAllocator:      metaAlloc,
 	}
 
-	memforgeAllocatorRegister(unsafe.Pointer(allocator), "Slab")
-
-	return allocator
+	memforgeAllocatorRegister(headerPtr, "Fixed Slab (Manual)")
+	return headerPtr
 }
 
-// SlabAllocatorDestroy destroys the allocator and cleans up.
-// Do NOT use the allocator anymore.
-func SlabAllocatorDestroy[T any](instance *FixedSlabAllocator[T]) {
-	memcore.MemmapUnmap(instance.storage)
-	FixedLinearAllocatorDestroy(instance.metaAllocator)
-	memforgeAllocatorDestroy(unsafe.Pointer(instance))
+// SlabAllocatorDestroy destroys the slab allocator and all registered pointers.
+//
+// Do NOT use the allocator after calling this.
+func SlabAllocatorDestroy[T any](allocator memcore.Pointer) {
+	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedSlabAllocator[T]](allocator)
 
-	instance.storage = nil
-	instance.metaAllocator = nil
-	instance.destroyed = true
-}
+	memforgeAllocatorDestroy(allocator)
+	memcore.MemcoreAddressSpaceUnregister(header.namespace)
 
-// SlabAllocatorReset allows memory within the allocator to be full re-used.
-// It does not zero out memory.
-// Using pointers from before the reset is undefined behaviour.
-func SlabAllocatorReset[T any](instance *FixedSlabAllocator[T]) {
-	slabAllocatorNotDestroyedGuarantee(instance)
-	primitives.StackClear(instance.freeStack)
-	memforgeAllocatorRemoveAll(unsafe.Pointer(instance))
+	primitives.StackDestroy[uint64](header.freeStack)
+	FixedLinearAllocatorDestroy(header.metaAllocator)
 
-	for i := instance.slotCapacity; i > 0; i-- {
-		primitives.StackPushUnsafe(instance.freeStack, i-1)
+	if err := memcore.MemmapUnmapAt(unsafe.Pointer(header.allocatorAddr), int(header.allocatorTotalSize)); err != nil {
+		panic(fmt.Errorf("slab allocator: failed to unmap: %w", err))
 	}
 }
 
-// SlabAllocatorMalloc allocates T from the allocator.
-// It does not zero the memory, therefore it may contain garbage.
-// Storing Go pointers ANYWHERE inside this allocation results in undefined behaviour.
+// SlabAllocatorReset clears the allocator, restoring all slots to free state.
+//
+// Using previously returned pointers after reset is undefined behaviour.
+func SlabAllocatorReset[T any](allocator memcore.Pointer) {
+	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedSlabAllocator[T]](allocator)
+
+	memforgeAllocatorRemoveAll(allocator)
+	memcore.MemcoreAddressSpaceClearPointers(header.namespace)
+	memcore.MemcorePointerRegister(allocator)
+
+	// Reset free stack
+	primitives.StackClear[uint64](header.freeStack)
+	for i := header.slotCapacity; i > 0; i-- {
+		primitives.StackPushUnsafe(header.freeStack, i-1)
+	}
+}
+
+// SlabAllocatorMalloc allocates one slot and returns a memcore.Pointer.
 //
 //go:nosplit
-func SlabAllocatorMalloc[T any](instance *FixedSlabAllocator[T]) unsafe.Pointer {
-	slabAllocatorNotDestroyedGuarantee(instance)
-	idx, err := primitives.StackPop(instance.freeStack)
+func SlabAllocatorMalloc[T any](allocator memcore.Pointer) memcore.Pointer {
+	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedSlabAllocator[T]](allocator)
 
+	idx, err := primitives.StackPop[uint64](header.freeStack)
 	if err != nil {
-		panic(fmt.Errorf("could not allocate: %w", err))
+		panic(fmt.Errorf("slab allocator: out of memory: %w", err))
 	}
 
-	addr := unsafe.Add(unsafe.Pointer(instance.base), idx*instance.slotSize)
-	memforgeAllocationAdd(unsafe.Pointer(instance), addr, instance.slotSize)
-	return addr
+	alignedIdx := slabAllocatorDataIdxGet(header, idx)
+	ptr := memcore.MemcorePointerCreate(header.namespace, uintptr(alignedIdx), memcore.TypeOf[T]())
+	memcore.MemcorePointerRegister(ptr)
+	memforgeAllocationAdd(allocator, ptr, header.slotSize)
+	return ptr
 }
 
-// SlabAllocatorCalloc allocates T from the allocator.
-// It also zeroes the memory.
-// Storing Go pointers ANYWHERE inside this allocation results in undefined behaviour.
+// SlabAllocatorCalloc allocates and zeroes a slot.
 //
 //go:nosplit
-func SlabAllocatorCalloc[T any](instance *FixedSlabAllocator[T]) unsafe.Pointer {
-	slabAllocatorNotDestroyedGuarantee(instance)
-	idx, err := primitives.StackPop(instance.freeStack)
-
-	if err != nil {
-		panic(fmt.Errorf("could not allocate: %w", err))
-	}
-
-	addr := unsafe.Add(unsafe.Pointer(instance.base), idx*instance.slotSize)
-	memforgeAllocationAdd(unsafe.Pointer(instance), addr, instance.slotSize)
-	memcore.MemoryClearNoHeapPointers(addr, uintptr(instance.slotSize))
-	return addr
+func SlabAllocatorCalloc[T any](allocator memcore.Pointer) memcore.Pointer {
+	ptr := SlabAllocatorMalloc[T](allocator)
+	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(memcore.SizeOf[T]()))
+	return ptr
 }
 
-// SlabAllocatorMallocUnsafe allocates T from the allocator.
-// It does not zero the memory, therefore it may contain garbage.
-// Storing Go pointers ANYWHERE inside this allocation results in undefined behaviour.
-//
-// Note: does not validate anything.
+// SlabAllocatorMallocUnsafe allocates without validation.
 //
 //go:nosplit
-func SlabAllocatorMallocUnsafe[T any](instance *FixedSlabAllocator[T]) unsafe.Pointer {
-	idx := primitives.StackPopUnsafe(instance.freeStack)
-	addr := unsafe.Add(unsafe.Pointer(instance.base), idx*instance.slotSize)
-	return addr
+func SlabAllocatorMallocUnsafe[T any](allocator memcore.Pointer) memcore.Pointer {
+	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedSlabAllocator[T]](allocator)
+	idx := primitives.StackPopUnsafe[uint64](header.freeStack)
+
+	offset := memcore.SizeOf[FixedSlabAllocator[T]]() + idx*header.slotSize
+	ptr := memcore.MemcorePointerCreate(header.namespace, uintptr(offset), memcore.TypeOf[T]())
+	memcore.MemcorePointerRegister(ptr)
+	return ptr
 }
 
-// SlabAllocatorCallocUnsafe allocates T from the allocator.
-// It also zeroes the memory.
-// Storing Go pointers ANYWHERE inside this allocation results in undefined behaviour.
-//
-// Note: does not validate anything.
+// SlabAllocatorCallocUnsafe allocates and zeroes memory without validation.
 //
 //go:nosplit
-func SlabAllocatorCallocUnsafe[T any](instance *FixedSlabAllocator[T]) unsafe.Pointer {
-	idx := primitives.StackPopUnsafe(instance.freeStack)
-	addr := unsafe.Add(unsafe.Pointer(instance.base), idx*instance.slotSize)
-	memcore.MemoryClearNoHeapPointers(addr, uintptr(instance.slotSize))
-	return addr
+func SlabAllocatorCallocUnsafe[T any](allocator memcore.Pointer) memcore.Pointer {
+	ptr := SlabAllocatorMallocUnsafe[T](allocator)
+	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(memcore.SizeOf[T]()))
+	return ptr
 }
 
-// SlabAllocatorMallocObject is a convenience wrapper around SlabAllocatorMalloc
-//
+// Convenience wrappers (typed access)
+// They only exist for ergonomic access in Go code, and never store Go pointers.
+
 //go:nosplit
-func SlabAllocatorMallocObject[T any](instance *FixedSlabAllocator[T]) *T {
-	addr := SlabAllocatorMalloc(instance)
-	return (*T)(addr)
+func SlabAllocatorMallocObject[T any](allocator memcore.Pointer) *T {
+	ptr := SlabAllocatorMalloc[T](allocator)
+	return memcore.MemcorePointerDereferenceObjectUnsafe[T](ptr)
 }
 
-// SlabAllocatorCallocObject is a convenience wrapper around SlabAllocatorCalloc
-//
 //go:nosplit
-func SlabAllocatorCallocObject[T any](instance *FixedSlabAllocator[T]) *T {
-	addr := SlabAllocatorCalloc(instance)
-	return (*T)(addr)
+func SlabAllocatorCallocObject[T any](allocator memcore.Pointer) *T {
+	ptr := SlabAllocatorCalloc[T](allocator)
+	return memcore.MemcorePointerDereferenceObjectUnsafe[T](ptr)
 }
 
-// SlabAllocatorMallocObjectUnsafe is a convenience wrapper around SlabAllocatorMallocUnsafe
-//
 //go:nosplit
-func SlabAllocatorMallocObjectUnsafe[T any](instance *FixedSlabAllocator[T]) *T {
-	addr := SlabAllocatorMallocUnsafe(instance)
-	return (*T)(addr)
+func SlabAllocatorMallocObjectUnsafe[T any](allocator memcore.Pointer) *T {
+	ptr := SlabAllocatorMallocUnsafe[T](allocator)
+	return memcore.MemcorePointerDereferenceObjectUnsafe[T](ptr)
 }
 
-// SlabAllocatorCallocObjectUnsafe is a convenience wrapper around SlabAllocatorCallocUnsafe
-//
 //go:nosplit
-func SlabAllocatorCallocObjectUnsafe[T any](instance *FixedSlabAllocator[T]) *T {
-	addr := SlabAllocatorCallocUnsafe(instance)
-	return (*T)(addr)
+func SlabAllocatorCallocObjectUnsafe[T any](allocator memcore.Pointer) *T {
+	ptr := SlabAllocatorCallocUnsafe[T](allocator)
+	return memcore.MemcorePointerDereferenceObjectUnsafe[T](ptr)
 }
 
 // -------------------------------------------- PRIVATE HELPERS
 
 //go:inline
-func slabAllocatorNotDestroyedGuarantee[T any](instance *FixedSlabAllocator[T]) {
-	if instance.destroyed {
-		panic("cannot use a destroyed allocator")
-	}
+func slabAllocatorDataIdxGet[T any](header *FixedSlabAllocator[T], idx uint64) uint64 {
+	return alignIdxUp(uint64(header.dataBaseOffset)+(idx*header.slotSize), header.slotAlignment)
 }

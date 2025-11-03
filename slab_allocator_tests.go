@@ -3,6 +3,7 @@ package memforge
 import (
 	commontesting "foundation/testing"
 	"math/rand"
+	"memcore"
 	"testing"
 	"unsafe"
 )
@@ -24,34 +25,37 @@ func TestFixedSlabAllocator(t *testing.T) {
 	t.Run("allocation_exhaustion_panics", testSlabAllocationExhaustionPanics)
 	t.Run("reset_allows_full_reuse", testSlabResetAllowsFullReuse)
 	t.Run("unsafe_functions_work_as_expected", testSlabUnsafeFunctionsWork)
-	t.Run("use_after_destroy_panics", testSlabUseAfterDestroyPanics)
 }
 
 // ---------------- Test Cases ----------------
 
 func testSlabCreateAndDestroy(t *testing.T) {
 	a := SlabAllocatorCreate[testSlabStruct](128)
-	commontesting.Assert(a != nil, "allocator should not be nil after create", "allocator created", t)
-	SlabAllocatorDestroy(a)
-	commontesting.Assert(a.destroyed, "allocator should be marked as destroyed", "allocator destroyed", t)
+
+	mustNotPanic(t, func() { memcore.MemcorePointerDereferenceObjectUnsafe[FixedSlabAllocator[testSlabStruct]](a) })
+
+	SlabAllocatorDestroy[testSlabStruct](a)
+	mustPanic(t, func() { memcore.MemcorePointerDereferenceObjectUnsafe[FixedSlabAllocator[testSlabStruct]](a) })
+
+	mustPanic(t, func() { SlabAllocatorMalloc[testSlabStruct](a) })
+	mustPanic(t, func() { SlabAllocatorCalloc[testSlabStruct](a) })
+	mustPanic(t, func() { SlabAllocatorReset[testSlabStruct](a) })
 }
 
 func testSlabCreateWithZeroCapacityPanics(t *testing.T) {
-	// Creation should immediately panic because capacity is 0.
 	mustPanic(t, func() {
 		SlabAllocatorCreate[testSlabStruct](0)
 	})
-	commontesting.Assert(true, "creating with zero capacity panicked as expected", "zero-cap create panics", t)
 }
 
 func testSlabMallocAndCallocObjects(t *testing.T) {
 	const capacity = 8
 	a := SlabAllocatorCreate[testSlabStruct](capacity)
-	defer SlabAllocatorDestroy(a)
+	defer SlabAllocatorDestroy[testSlabStruct](a)
 
 	// 1. Allocate some objects with Malloc
-	p1 := SlabAllocatorMallocObject(a)
-	p2 := SlabAllocatorMallocObject(a)
+	p1 := SlabAllocatorMallocObject[testSlabStruct](a)
+	p2 := SlabAllocatorMallocObject[testSlabStruct](a)
 
 	// Write distinct data to them
 	p1.val1 = 1111
@@ -60,8 +64,8 @@ func testSlabMallocAndCallocObjects(t *testing.T) {
 	p2.val2 = 6.28
 
 	// 2. Allocate the rest with Calloc
-	p3 := SlabAllocatorCallocObject(a)
-	p4 := SlabAllocatorCallocObject(a)
+	p3 := SlabAllocatorCallocObject[testSlabStruct](a)
+	p4 := SlabAllocatorCallocObject[testSlabStruct](a)
 
 	// 3. Verify data integrity of Malloc'd objects
 	commontesting.Assert(p1.val1 == 1111, "p1 data was corrupted", "p1 data preserved", t)
@@ -83,9 +87,10 @@ func testSlabMallocAndCallocObjects(t *testing.T) {
 
 func testSlabCallocZeroesMemory(t *testing.T) {
 	a := SlabAllocatorCreate[testSlabStruct](4)
-	defer SlabAllocatorDestroy(a)
+	defer SlabAllocatorDestroy[testSlabStruct](a)
 
-	p := SlabAllocatorCalloc(a)
+	ptr := SlabAllocatorCalloc[testSlabStruct](a)
+	p := memcore.MemcorePointerDereferenceRaw(ptr)
 	byteSlice := unsafe.Slice((*byte)(p), unsafe.Sizeof(testSlabStruct{}))
 	commontesting.Assert(allEqual(byteSlice, 0x00), "calloc did not zero memory", "calloc zeroed", t)
 
@@ -97,74 +102,74 @@ func testSlabCallocZeroesMemory(t *testing.T) {
 func testSlabAllocationExhaustionPanics(t *testing.T) {
 	const capacity = 4
 	a := SlabAllocatorCreate[testSlabStruct](capacity)
-	defer SlabAllocatorDestroy(a)
+	defer SlabAllocatorDestroy[testSlabStruct](a)
 
 	// Allocate all available slots
 	for i := 0; i < capacity; i++ {
-		p := SlabAllocatorMalloc(a)
-		commontesting.Assert(p != nil, "allocation failed before exhaustion", "allocation ok", t)
+		ptr := SlabAllocatorMalloc[testSlabStruct](a)
+		commontesting.Assert(ptr != memcore.Pointer{}, "allocation failed before exhaustion", "allocation ok", t)
 	}
 
 	// Next allocation should panic
 	mustPanic(t, func() {
-		SlabAllocatorMalloc(a)
+		SlabAllocatorMalloc[testSlabStruct](a)
 	})
 	mustPanic(t, func() {
-		SlabAllocatorCalloc(a)
+		SlabAllocatorCalloc[testSlabStruct](a)
 	})
 }
 
 func testSlabResetAllowsFullReuse(t *testing.T) {
 	const capacity = 8
 	a := SlabAllocatorCreate[testSlabStruct](capacity)
-	defer SlabAllocatorDestroy(a)
+	defer SlabAllocatorDestroy[testSlabStruct](a)
 
-	ptrsBeforeReset := make([]unsafe.Pointer, capacity)
+	ptrsBeforeReset := make([]memcore.Pointer, capacity)
 	for i := 0; i < capacity; i++ {
-		ptrsBeforeReset[i] = SlabAllocatorMalloc(a)
+		ptrsBeforeReset[i] = SlabAllocatorMalloc[testSlabStruct](a)
 	}
 
 	// Verify it's full
-	mustPanic(t, func() { SlabAllocatorMalloc(a) })
+	mustPanic(t, func() { SlabAllocatorMalloc[testSlabStruct](a) })
 
-	// Reset the allocator
-	SlabAllocatorReset(a)
-	commontesting.Assert(true, "reset should not panic", "reset ok", t)
+	// Reset the allocator - this should not panic
+	mustNotPanic(t, func() {
+		SlabAllocatorReset[testSlabStruct](a)
+	})
 
 	// We should be able to allocate the full capacity again
-	ptrsAfterReset := make([]unsafe.Pointer, capacity)
+	ptrsAfterReset := make([]memcore.Pointer, capacity)
 	for i := 0; i < capacity; i++ {
-		ptrsAfterReset[i] = SlabAllocatorMalloc(a)
-		commontesting.Assert(ptrsAfterReset[i] != nil, "allocation failed after reset", "re-allocation ok", t)
+		ptrsAfterReset[i] = SlabAllocatorMalloc[testSlabStruct](a)
+		commontesting.Assert(ptrsAfterReset[i] != memcore.Pointer{}, "allocation failed after reset", "re-allocation ok", t)
 	}
 
 	// The sequence of pointers should be identical, as the free list is reset the same way
 	for i := 0; i < capacity; i++ {
-		commontesting.Assert(ptrsBeforeReset[i] == ptrsAfterReset[i], "pointer mismatch after reset", "reset reuses memory predictably", t)
+		addr1 := memcore.MemcorePointerDereferenceRaw(ptrsBeforeReset[i])
+		addr2 := memcore.MemcorePointerDereferenceRaw(ptrsAfterReset[i])
+		commontesting.Assert(addr1 == addr2, "pointer mismatch after reset", "reset reuses memory predictably", t)
 	}
 }
 
 func testSlabUnsafeFunctionsWork(t *testing.T) {
 	a := SlabAllocatorCreate[testSlabStruct](4)
-	defer SlabAllocatorDestroy(a)
+	defer SlabAllocatorDestroy[testSlabStruct](a)
 
-	// Test unsafe malloc
-	p1 := SlabAllocatorMallocObjectUnsafe(a)
-	p1.val1 = rand.Uint64()
-	commontesting.Assert(p1.val1 != 0, "unsafe malloc failed to return valid memory", "unsafe malloc ok", t)
+	// Test unsafe malloc - verify we get non-nil memory
+	p1 := SlabAllocatorMallocObjectUnsafe[testSlabStruct](a)
+	randomValue := rand.Uint64()
+	if randomValue == 0 {
+		randomValue = 1 // ensure non-zero for test
+	}
+	p1.val1 = randomValue
+	commontesting.Assert(p1.val1 == randomValue, "unsafe malloc failed to return valid memory", "unsafe malloc ok", t)
 
-	// Test unsafe calloc
-	p2 := SlabAllocatorCallocObjectUnsafe(a)
-	commontesting.Assert(p2.val1 == 0, "unsafe calloc did not zero memory", "unsafe calloc ok", t)
-	p2.val1 = 1 // write to it
-	commontesting.Assert(p2.val1 == 1, "write after unsafe calloc failed", "write after unsafe calloc ok", t)
-}
+	// Test unsafe calloc - verify memory is zeroed
+	p2 := SlabAllocatorCallocObjectUnsafe[testSlabStruct](a)
+	commontesting.Assert(p2.val1 == 0 && p2.val2 == 0.0, "unsafe calloc did not zero memory", "unsafe calloc ok", t)
 
-func testSlabUseAfterDestroyPanics(t *testing.T) {
-	a := SlabAllocatorCreate[testSlabStruct](16)
-	SlabAllocatorDestroy(a)
-
-	mustPanic(t, func() { SlabAllocatorMalloc(a) })
-	mustPanic(t, func() { SlabAllocatorCalloc(a) })
-	mustPanic(t, func() { SlabAllocatorReset(a) })
+	// Verify we can write to calloc'd memory
+	p2.val1 = 12345
+	commontesting.Assert(p2.val1 == 12345, "write after unsafe calloc failed", "write after unsafe calloc ok", t)
 }

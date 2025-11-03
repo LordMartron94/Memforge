@@ -4,66 +4,76 @@ package memforge
 
 import (
 	"fmt"
-	"runtime"
+	"memcore"
 	"slices"
 	"strings"
 	"time"
-	"unsafe"
 )
 
-var debugStats = make(map[uintptr]*allocatorStats)
+// ANSI color codes
+const (
+	colorReset   = "\033[0m"
+	colorRed     = "\033[31m"
+	colorGreen   = "\033[32m"
+	colorYellow  = "\033[33m"
+	colorBlue    = "\033[34m"
+	colorMagenta = "\033[35m"
+	colorCyan    = "\033[36m"
+	colorWhite   = "\033[37m"
+	colorGray    = "\033[90m"
+
+	colorBoldRed     = "\033[1;31m"
+	colorBoldGreen   = "\033[1;32m"
+	colorBoldYellow  = "\033[1;33m"
+	colorBoldBlue    = "\033[1;34m"
+	colorBoldMagenta = "\033[1;35m"
+	colorBoldCyan    = "\033[1;36m"
+	colorBoldWhite   = "\033[1;37m"
+
+	// Background colors for highlights
+	bgRed    = "\033[41m"
+	bgYellow = "\033[43m"
+	bgGreen  = "\033[42m"
+)
+
+var debugStats = make(map[memcore.Pointer]*allocatorStats)
 
 type allocatorStats struct {
 	allocatorName                                        string
+	creator                                              string
 	destroyed                                            bool
 	createdAt                                            time.Time
-	creator                                              string // file:line (func)
 	allAllocations                                       []allocation
 	currentlyLiveAllocations                             []allocation
 	totalBytes, liveBytes, peakLiveBytes, peakLiveAllocs uint64
 }
 
 type allocation struct {
-	ptr       uintptr
+	ptr       memcore.Pointer
 	sizeBytes uint64
 	timestamp time.Time
-	stack     string // only captured when leak debugging
 }
 
 // Register a new allocator and record its creation site.
-func memforgeAllocatorRegister(allocatorPtr unsafe.Pointer, name string) {
-	var pcs [3]uintptr
-	n := runtime.Callers(2, pcs[:])
-	frame, _ := runtime.CallersFrames(pcs[:n]).Next()
-
-	debugStats[uintptr(allocatorPtr)] = &allocatorStats{
+func memforgeAllocatorRegister(allocatorPtr memcore.Pointer, name string) {
+	debugStats[allocatorPtr] = &allocatorStats{
 		allocatorName: name,
 		createdAt:     time.Now(),
-		creator:       fmt.Sprintf("%s:%d (%s)", frame.File, frame.Line, frame.Function),
+		creator:       allocatorPtr.CallStack(),
 	}
 }
 
 // Record a new allocation in the debug tracker.
-func memforgeAllocationAdd(allocatorPtr, allocationPtr unsafe.Pointer, sizeBytes uint64) {
-	ptr := uintptr(allocatorPtr)
-	stats := debugStats[ptr]
+func memforgeAllocationAdd(allocatorPtr, allocationPtr memcore.Pointer, sizeBytes uint64) {
+	stats := debugStats[allocatorPtr]
 	if stats == nil {
 		return
 	}
 
-	// only capture stack when debugging mode enabled or large allocation
-	stack := ""
-	if sizeBytes > 4096 {
-		buf := make([]byte, 512)
-		n := runtime.Stack(buf, false)
-		stack = string(buf[:n])
-	}
-
 	entry := allocation{
-		ptr:       uintptr(allocationPtr),
+		ptr:       allocationPtr,
 		sizeBytes: sizeBytes,
 		timestamp: time.Now(),
-		stack:     stack,
 	}
 	stats.allAllocations = append(stats.allAllocations, entry)
 	stats.currentlyLiveAllocations = append(stats.currentlyLiveAllocations, entry)
@@ -79,12 +89,12 @@ func memforgeAllocationAdd(allocatorPtr, allocationPtr unsafe.Pointer, sizeBytes
 }
 
 // Remove a single freed allocation.
-func memforgeAllocationRemove(allocatorPtr, allocationPtr unsafe.Pointer) {
-	stats := debugStats[uintptr(allocatorPtr)]
+func memforgeAllocationRemove(allocatorPtr, allocationPtr memcore.Pointer) {
+	stats := debugStats[allocatorPtr]
 	if stats == nil {
 		return
 	}
-	ptr2 := uintptr(allocationPtr)
+	ptr2 := allocationPtr
 	stats.currentlyLiveAllocations = slices.DeleteFunc(stats.currentlyLiveAllocations, func(a allocation) bool {
 		if a.ptr == ptr2 {
 			stats.liveBytes -= a.sizeBytes
@@ -95,15 +105,15 @@ func memforgeAllocationRemove(allocatorPtr, allocationPtr unsafe.Pointer) {
 }
 
 // Marks an allocator as destroyed.
-func memforgeAllocatorDestroy(allocatorPtr unsafe.Pointer) {
+func memforgeAllocatorDestroy(allocatorPtr memcore.Pointer) {
 	memforgeAllocatorRemoveAll(allocatorPtr)
-	stats := debugStats[uintptr(allocatorPtr)]
+	stats := debugStats[allocatorPtr]
 	stats.destroyed = true
 }
 
 // Remove all allocations for an allocator.
-func memforgeAllocatorRemoveAll(allocatorPtr unsafe.Pointer) {
-	stats := debugStats[uintptr(allocatorPtr)]
+func memforgeAllocatorRemoveAll(allocatorPtr memcore.Pointer) {
+	stats := debugStats[allocatorPtr]
 	if stats == nil {
 		return
 	}
@@ -114,7 +124,10 @@ func memforgeAllocatorRemoveAll(allocatorPtr unsafe.Pointer) {
 // MemforgeMemoryDebug prints a focused summary of allocator usage and leaks.
 func MemforgeMemoryDebug() {
 	if len(debugStats) == 0 {
-		fmt.Println("🧩 Memforge: no allocators registered.")
+		fmt.Printf("\n%s╔════════════════════════════════════════════════════════════════════════════╗%s\n", colorBoldCyan, colorReset)
+		fmt.Printf("%s║                        MEMFORGE MEMORY DEBUGGER                            ║%s\n", colorBoldCyan, colorReset)
+		fmt.Printf("%s╚════════════════════════════════════════════════════════════════════════════╝%s\n", colorBoldCyan, colorReset)
+		fmt.Printf("\n%s🧩 No allocators registered%s\n\n", colorYellow, colorReset)
 		return
 	}
 
@@ -154,48 +167,109 @@ func (t *globalTotals) add(other globalTotals) {
 }
 
 func writeHeader(sb *strings.Builder) {
-	sb.WriteString("\n━━━━━━━━━━━━━━━━━━━━━━━\n")
-	sb.WriteString("🧩 MEMFORGE MEMORY DEBUGGER\n")
-	sb.WriteString(fmt.Sprintf("Time: %s\n", time.Now().Format(time.RFC3339)))
-	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━━\n")
+	const boxWidth = 100
+	sb.WriteString(fmt.Sprintf("\n%s╔%s╗%s\n", colorBoldCyan, strings.Repeat("═", boxWidth-2), colorReset))
+
+	headerText := "MEMFORGE MEMORY DEBUGGER"
+	padding := (boxWidth - 2 - len(headerText)) / 2
+	sb.WriteString(fmt.Sprintf("%s║%s%s%s%s║%s\n",
+		colorBoldCyan,
+		strings.Repeat(" ", padding),
+		headerText,
+		strings.Repeat(" ", boxWidth-2-padding-len(headerText)),
+		colorBoldCyan,
+		colorReset))
+
+	timeText := fmt.Sprintf("Time: %s", time.Now().Format("2006-01-02 15:04:05"))
+	timePadding := (boxWidth - 2 - len(timeText)) / 2
+	sb.WriteString(fmt.Sprintf("%s║%s%s%s%s%s║%s\n",
+		colorBoldCyan,
+		strings.Repeat(" ", timePadding),
+		colorGray,
+		timeText,
+		colorReset,
+		strings.Repeat(" ", boxWidth-2-timePadding-len(timeText)),
+		colorReset))
+
+	sb.WriteString(fmt.Sprintf("%s╚%s╝%s\n\n", colorBoldCyan, strings.Repeat("═", boxWidth-2), colorReset))
 }
 
 func writeGlobalSummary(sb *strings.Builder, totals globalTotals, typeCount, allocatorCount int) {
+	const boxWidth = 100
+
 	destroyedCount := 0
 	for _, st := range debugStats {
 		if st.destroyed {
 			destroyedCount++
 		}
 	}
+	activeCount := allocatorCount - destroyedCount
 
-	sb.WriteString("\n━━━━━━━━━━━━━━━━━━━━━━━\n")
-	sb.WriteString("📊 GLOBAL SUMMARY\n")
-	sb.WriteString(fmt.Sprintf("  Allocator types: %d\n", typeCount))
-	sb.WriteString(fmt.Sprintf("  Total allocators: %d (destroyed=%d, active=%d)\n",
-		allocatorCount, destroyedCount, allocatorCount-destroyedCount))
-	sb.WriteString(fmt.Sprintf("  Total allocations: %d\n", totals.totalAllocs))
-	sb.WriteString(fmt.Sprintf("  Live allocations:  %d\n", totals.totalLiveAllocs))
-	sb.WriteString(fmt.Sprintf("  Bytes total: %s   Live: %s\n",
-		humanBytes(float64(totals.totalBytes)),
-		humanBytes(float64(totals.totalLiveBytes))))
+	sb.WriteString(fmt.Sprintf("\n%s┌─ Global Summary %s\n", colorBoldWhite, strings.Repeat("─", boxWidth-18)))
 
+	// Statistics
+	sb.WriteString(fmt.Sprintf("%s│%s  %sAllocator Types:%s %s%d%s\n",
+		colorBoldWhite, colorReset, colorWhite, colorReset, colorCyan, typeCount, colorReset))
+
+	sb.WriteString(fmt.Sprintf("%s│%s  %sTotal Allocators:%s %s%d%s",
+		colorBoldWhite, colorReset, colorWhite, colorReset, colorBoldGreen, allocatorCount, colorReset))
+	sb.WriteString(fmt.Sprintf("  %s(%sActive:%s %s%d%s  %sDestroyed:%s %s%d%s%s)%s\n",
+		colorGray, colorWhite, colorReset, colorGreen, activeCount, colorReset,
+		colorWhite, colorReset, colorYellow, destroyedCount, colorReset, colorGray, colorReset))
+
+	sb.WriteString(fmt.Sprintf("%s│%s\n", colorBoldWhite, colorReset))
+
+	// Memory statistics
+	sb.WriteString(fmt.Sprintf("%s│%s  %sTotal Allocations:%s %s%d%s\n",
+		colorBoldWhite, colorReset, colorWhite, colorReset, colorCyan, totals.totalAllocs, colorReset))
+
+	liveAllocsColor := colorGreen
 	if totals.totalLiveAllocs > 0 {
-		sb.WriteString(fmt.Sprintf("  🚨 %d live allocations remain across all allocators\n", totals.totalLiveAllocs))
-	} else {
-		sb.WriteString("  ✅ All memory freed — no leaks detected\n")
+		liveAllocsColor = colorRed
 	}
-	sb.WriteString("━━━━━━━━━━━━━━━━━━━━━━━\n")
+	sb.WriteString(fmt.Sprintf("%s│%s  %sLive Allocations:%s  %s%d%s\n",
+		colorBoldWhite, colorReset, colorWhite, colorReset, liveAllocsColor, totals.totalLiveAllocs, colorReset))
+
+	sb.WriteString(fmt.Sprintf("%s│%s\n", colorBoldWhite, colorReset))
+
+	sb.WriteString(fmt.Sprintf("%s│%s  %sTotal Bytes Allocated:%s %s%s%s\n",
+		colorBoldWhite, colorReset, colorWhite, colorReset, colorCyan, humanBytes(float64(totals.totalBytes)), colorReset))
+
+	liveBytesColor := colorGreen
+	if totals.totalLiveBytes > 0 {
+		liveBytesColor = colorYellow
+	}
+	sb.WriteString(fmt.Sprintf("%s│%s  %sLive Bytes:%s           %s%s%s\n",
+		colorBoldWhite, colorReset, colorWhite, colorReset, liveBytesColor, humanBytes(float64(totals.totalLiveBytes)), colorReset))
+
+	sb.WriteString(fmt.Sprintf("%s│%s\n", colorBoldWhite, colorReset))
+
+	// Final verdict
+	if totals.totalLiveAllocs > 0 {
+		sb.WriteString(fmt.Sprintf("%s│%s  %s⚠️  MEMORY LEAK DETECTED%s\n",
+			colorBoldWhite, colorReset, colorBoldRed, colorReset))
+		sb.WriteString(fmt.Sprintf("%s│%s  %s%d live allocation%s remain%s across all allocators\n",
+			colorBoldWhite, colorReset, colorRed, totals.totalLiveAllocs,
+			pluralize(totals.totalLiveAllocs), colorReset))
+		sb.WriteString(fmt.Sprintf("%s│%s  %sLive memory: %s%s\n",
+			colorBoldWhite, colorReset, colorRed, humanBytes(float64(totals.totalLiveBytes)), colorReset))
+	} else {
+		sb.WriteString(fmt.Sprintf("%s│%s  %s✅ All memory freed — no leaks detected%s\n",
+			colorBoldWhite, colorReset, colorBoldGreen, colorReset))
+	}
+
+	sb.WriteString(fmt.Sprintf("%s└%s\n\n", colorBoldWhite, strings.Repeat("─", boxWidth-1)))
 }
 
-func groupAllocatorsByType(stats map[uintptr]*allocatorStats) map[string][]uintptr {
-	group := make(map[string][]uintptr)
+func groupAllocatorsByType(stats map[memcore.Pointer]*allocatorStats) map[string][]memcore.Pointer {
+	group := make(map[string][]memcore.Pointer)
 	for ptr, st := range stats {
 		group[st.allocatorName] = append(group[st.allocatorName], ptr)
 	}
 	return group
 }
 
-func sortedTypeNames(group map[string][]uintptr) []string {
+func sortedTypeNames(group map[string][]memcore.Pointer) []string {
 	names := make([]string, 0, len(group))
 	for name := range group {
 		names = append(names, name)
@@ -204,7 +278,7 @@ func sortedTypeNames(group map[string][]uintptr) []string {
 	return names
 }
 
-func computeTypeTotals(ptrs []uintptr) globalTotals {
+func computeTypeTotals(ptrs []memcore.Pointer) globalTotals {
 	var totals globalTotals
 	for _, p := range ptrs {
 		st := debugStats[p]
@@ -216,8 +290,9 @@ func computeTypeTotals(ptrs []uintptr) globalTotals {
 	return totals
 }
 
-func writeTypeSummary(sb *strings.Builder, name string, ptrs []uintptr, totals globalTotals) {
-	sb.WriteString(fmt.Sprintf("\n📦 %s\n", name))
+func writeTypeSummary(sb *strings.Builder, name string, ptrs []memcore.Pointer, totals globalTotals) {
+	const boxWidth = 100
+
 	destroyedCount := 0
 	for _, addr := range ptrs {
 		if debugStats[addr].destroyed {
@@ -226,21 +301,57 @@ func writeTypeSummary(sb *strings.Builder, name string, ptrs []uintptr, totals g
 	}
 	activeCount := len(ptrs) - destroyedCount
 
-	sb.WriteString(fmt.Sprintf("  allocators: %d (active=%d, destroyed=%d)\n",
-		len(ptrs), activeCount, destroyedCount))
-	sb.WriteString(fmt.Sprintf("  total=%s  live=%s  leaks=%d\n",
-		humanBytes(float64(totals.totalBytes)),
-		humanBytes(float64(totals.totalLiveBytes)),
-		totals.totalLiveAllocs))
-
-	if len(ptrs) <= 5 || totals.totalLiveAllocs > 0 {
-		for _, addr := range ptrs {
-			writeAllocatorSummary(sb, addr)
-		}
+	// Type header
+	remainingWidth := boxWidth - len(name) - len(fmt.Sprintf(" [%d allocators]", len(ptrs))) - 4
+	if remainingWidth < 0 {
+		remainingWidth = 0
 	}
+
+	sb.WriteString(fmt.Sprintf("%s┌─ %s%s%s%s %s%s\n",
+		colorBoldYellow,
+		colorBoldMagenta,
+		name,
+		colorReset,
+		colorGray,
+		fmt.Sprintf("[%d allocator%s]", len(ptrs), pluralize(len(ptrs))),
+		strings.Repeat("─", remainingWidth)))
+
+	// Summary statistics
+	sb.WriteString(fmt.Sprintf("%s│%s  %sActive:%s %s%d%s  %sDestroyed:%s %s%d%s  ",
+		colorYellow, colorReset,
+		colorWhite, colorReset, colorGreen, activeCount, colorReset,
+		colorWhite, colorReset, colorGray, destroyedCount, colorReset))
+
+	leakColor := colorGreen
+	leakSymbol := "✅"
+	if totals.totalLiveAllocs > 0 {
+		leakColor = colorRed
+		leakSymbol = "🚨"
+	}
+	sb.WriteString(fmt.Sprintf("%sLeaks:%s %s%d%s %s%s\n",
+		colorWhite, colorReset, leakColor, totals.totalLiveAllocs, colorReset, leakSymbol, colorReset))
+
+	sb.WriteString(fmt.Sprintf("%s│%s  %sTotal:%s %s%s%s  %sLive:%s %s%s%s\n",
+		colorYellow, colorReset,
+		colorWhite, colorReset, colorCyan, humanBytes(float64(totals.totalBytes)), colorReset,
+		colorWhite, colorReset, colorYellow, humanBytes(float64(totals.totalLiveBytes)), colorReset))
+
+	sb.WriteString(fmt.Sprintf("%s│%s\n", colorYellow, colorReset))
+
+	// Show allocator details if there are leaks or few allocators
+	if len(ptrs) <= 5 || totals.totalLiveAllocs > 0 {
+		for i, addr := range ptrs {
+			writeAllocatorSummary(sb, addr, i == len(ptrs)-1)
+		}
+	} else {
+		sb.WriteString(fmt.Sprintf("%s│%s  %s... %d more allocators (use fewer allocators or check for leaks to see details)%s\n",
+			colorYellow, colorReset, colorGray, len(ptrs)-5, colorReset))
+	}
+
+	sb.WriteString(fmt.Sprintf("%s└%s%s\n\n", colorYellow, strings.Repeat("─", boxWidth-1), colorReset))
 }
 
-func writeAllocatorSummary(sb *strings.Builder, addr uintptr) {
+func writeAllocatorSummary(sb *strings.Builder, addr memcore.Pointer, isLast bool) {
 	st := debugStats[addr]
 	if len(st.allAllocations) == 0 {
 		return
@@ -252,27 +363,64 @@ func writeAllocatorSummary(sb *strings.Builder, addr uintptr) {
 		return
 	}
 
-	// Determine status
-	status := allocatorStatus(st)
+	var allocVal string
+	if st.destroyed {
+		allocVal = fmt.Sprintf("%s<destroyed>%s", colorGray, colorReset)
+	} else {
+		allocVal = fmt.Sprintf("%s0x%016x%s", colorBlue, memcore.MemcorePointerDereferenceRaw(addr), colorReset)
+	}
 
-	sb.WriteString(fmt.Sprintf("    → %#x  allocs=%-3d live=%-3d bytes=%-10s %s\n",
-		addr, allocCount, liveCount, humanBytes(float64(st.totalBytes)), status))
-	sb.WriteString(fmt.Sprintf("      created %s | %s\n",
-		st.createdAt.Format("15:04:05"), st.creator))
+	// Status and icon
+	status, statusColor, icon := allocatorStatusInfo(st)
+
+	sb.WriteString(fmt.Sprintf("%s│%s  %s%s%s %s  %sAllocs:%s %s%-4d%s %sLive:%s %s%-4d%s %sBytes:%s %s%-12s%s %s%s%s\n",
+		colorYellow, colorReset,
+		statusColor, icon, colorReset,
+		allocVal,
+		colorWhite, colorReset, colorCyan, allocCount, colorReset,
+		colorWhite, colorReset, colorYellow, liveCount, colorReset,
+		colorWhite, colorReset, colorMagenta, humanBytes(float64(st.totalBytes)), colorReset,
+		statusColor, status, colorReset))
+
+	// Creation info
+	age := time.Since(st.createdAt)
+	sb.WriteString(fmt.Sprintf("%s│%s     %s└─ Created:%s %s%s%s %s(%s ago)%s\n",
+		colorYellow, colorReset,
+		colorGray, colorReset,
+		colorGray, st.createdAt.Format("15:04:05"), colorReset,
+		colorGray, formatDuration(age), colorReset))
+
+	// Creator callstack (indented)
+	creatorLines := strings.Split(st.creator, "\n")
+	for i, line := range creatorLines {
+		if i == 0 {
+			sb.WriteString(fmt.Sprintf("%s│%s        %s%s%s\n",
+				colorYellow, colorReset, colorCyan, strings.TrimSpace(line), colorReset))
+		} else {
+			sb.WriteString(fmt.Sprintf("%s│%s        %s%s%s\n",
+				colorYellow, colorReset, colorGray, strings.TrimSpace(line), colorReset))
+		}
+	}
 
 	if liveCount > 0 {
 		writeLiveAllocations(sb, st.currentlyLiveAllocations)
 	}
+
+	if !isLast {
+		sb.WriteString(fmt.Sprintf("%s│%s\n", colorYellow, colorReset))
+	}
 }
 
-func allocatorStatus(st *allocatorStats) string {
+func allocatorStatusInfo(st *allocatorStats) (string, string, string) {
 	switch {
 	case st.destroyed && len(st.currentlyLiveAllocations) > 0:
-		return "🚨 [DESTROYED — LEAKED]"
+		return "DESTROYED + LEAKED", colorBoldRed, "💥"
 	case st.destroyed:
-		return "✅ [DESTROYED]"
+		return "DESTROYED", colorGreen, "✅"
+	case len(st.currentlyLiveAllocations) > 0:
+		return "ACTIVE + LEAKING", colorBoldYellow, "⚠️"
 	default:
-		return "⚠️ [ACTIVE]"
+		return "ACTIVE", colorGreen, "●"
 	}
 }
 
@@ -289,19 +437,39 @@ func writeLiveAllocations(sb *strings.Builder, allocs []allocation) {
 		}
 	})
 
-	sb.WriteString("      🔴 Live allocations:\n")
+	sb.WriteString(fmt.Sprintf("%s│%s\n", colorYellow, colorReset))
+	sb.WriteString(fmt.Sprintf("%s│%s     %s🔴 Live Allocations (top %d by size):%s\n",
+		colorYellow, colorReset, colorBoldRed, min(3, len(live)), colorReset))
+
 	for i := 0; i < min(3, len(live)); i++ {
 		a := live[i]
-		sb.WriteString(fmt.Sprintf("        • %#x  %s  at %s\n",
-			a.ptr,
-			humanBytes(float64(a.sizeBytes)),
-			a.timestamp.Format("15:04:05")))
+		age := time.Since(a.timestamp)
 
-		if a.stack != "" {
-			stack := indent(a.stack, "          ")
-			sb.WriteString(stack)
-			sb.WriteRune('\n')
+		sb.WriteString(fmt.Sprintf("%s│%s        %s•%s %sAddr:%s %s0x%016x%s  %sSize:%s %s%-10s%s %s(%s ago)%s\n",
+			colorYellow, colorReset,
+			colorRed, colorReset,
+			colorWhite, colorReset,
+			colorBlue, memcore.MemcorePointerDereferenceRaw(a.ptr), colorReset,
+			colorWhite, colorReset,
+			colorMagenta, humanBytes(float64(a.sizeBytes)), colorReset,
+			colorGray, formatDuration(age), colorReset))
+
+		// Callstack for allocation
+		callstackLines := strings.Split(a.ptr.CallStack(), "\n")
+		for j, line := range callstackLines {
+			if j == 0 {
+				sb.WriteString(fmt.Sprintf("%s│%s          %s%s%s\n",
+					colorYellow, colorReset, colorCyan, strings.TrimSpace(line), colorReset))
+			} else {
+				sb.WriteString(fmt.Sprintf("%s│%s          %s%s%s\n",
+					colorYellow, colorReset, colorGray, strings.TrimSpace(line), colorReset))
+			}
 		}
+	}
+
+	if len(live) > 3 {
+		sb.WriteString(fmt.Sprintf("%s│%s        %s... and %d more leaked allocation%s%s\n",
+			colorYellow, colorReset, colorRed, len(live)-3, pluralize(len(live)-3), colorReset))
 	}
 }
 
@@ -318,17 +486,32 @@ func humanBytes(b float64) string {
 	}
 }
 
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%.1fm", d.Minutes())
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%.1fh", d.Hours())
+	}
+	return fmt.Sprintf("%.1fd", d.Hours()/24)
+}
+
+func pluralize(count int) string {
+	if count == 1 {
+		return ""
+	}
+	return "s"
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
 	}
 	return b
-}
-
-func indent(s, prefix string) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	for i := range lines {
-		lines[i] = prefix + lines[i]
-	}
-	return strings.Join(lines, "\n")
 }
