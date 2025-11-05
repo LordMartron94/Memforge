@@ -167,7 +167,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 							d.counter = 0
 						}
 						ptr := FixedLinearAllocatorMalloc(d.allocator, uint64(size), 16)
-						goHeapSink = ptr
+						_ = ptr
 						d.counter++
 					}
 				},
@@ -204,7 +204,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 							d.counter = 0
 						}
 						ptr := DynamicLinearAllocatorMalloc(d.allocator, uint64(size), 16)
-						goHeapSink = ptr
+						_ = ptr
 						d.counter++
 					}
 				},
@@ -240,7 +240,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 							d.counter = 0
 						}
 						ptr := FixedManualAllocatorMalloc(d.allocator, uint64(size), 16)
-						goHeapSink = ptr
+						_ = ptr
 						d.counter++
 					}
 				},
@@ -284,7 +284,6 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 							}
 							ptr := SlabAllocatorMalloc[Block](d.allocator)
 							d.ptrs = append(d.ptrs, ptr)
-							goHeapSink = ptr
 						}
 					},
 					func(d benchData, b *testing.B) {
@@ -459,7 +458,7 @@ func BenchmarkAllocatorSuite_MixedSizeWorkload(b *testing.B) {
 						d.bytesUsed = 0
 					}
 					ptr := FixedLinearAllocatorMalloc(d.allocator, size, 16)
-					goHeapSink = ptr
+					_ = ptr
 					d.bytesUsed += size
 				}
 			},
@@ -496,7 +495,7 @@ func BenchmarkAllocatorSuite_MixedSizeWorkload(b *testing.B) {
 					}
 					size := uint64(sizes[i%len(sizes)])
 					ptr := FixedManualAllocatorMalloc(d.allocator, size, 16)
-					goHeapSink = ptr
+					_ = ptr
 					d.count++
 				}
 			},
@@ -541,9 +540,6 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 					idx := i % poolSize
 					FixedManualAllocatorFree(d.allocator, d.ptrs[idx])
 					d.ptrs[idx] = FixedManualAllocatorMalloc(d.allocator, objSize, 16)
-					if i%stride == 0 {
-						goHeapSink = d.ptrs[idx]
-					}
 				}
 			},
 			func(d benchData, b *testing.B) {
@@ -574,7 +570,7 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					for j := 0; j < batch; j++ {
 						ptr := FixedManualAllocatorMalloc(d.allocator, objSize, 16)
-						goHeapSink = ptr
+						_ = ptr
 					}
 					FixedManualAllocatorReset(d.allocator)
 				}
