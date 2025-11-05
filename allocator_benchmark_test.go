@@ -70,7 +70,7 @@ func benchmarkWithMetrics[data any](
 	}
 
 	memcore.MemmapUnmapAllRegions()
-	memcore.MemcoreResetState(false)
+	memcore.MemcoreMarkManagementStateReset(false)
 	debug.FreeOSMemory()
 
 	if panicValue != nil {
@@ -140,7 +140,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 		// Fixed Linear Allocator
 		b.Run(groupName+"/FixedLinear", func(b *testing.B) {
 			type benchData struct {
-				allocator    memcore.Pointer
+				allocator    memcore.MarkRaw
 				counter      int
 				limit        int
 				oldGCPercent int
@@ -181,7 +181,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 		// Dynamic Linear Allocator
 		b.Run(groupName+"/DynamicLinear", func(b *testing.B) {
 			type benchData struct {
-				allocator    memcore.Pointer
+				allocator    memcore.MarkRaw
 				counter      int
 				limit        int
 				oldGCPercent int
@@ -218,7 +218,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 		// Fixed Manual Allocator
 		b.Run(groupName+"/FixedManual", func(b *testing.B) {
 			type benchData struct {
-				allocator    memcore.Pointer
+				allocator    memcore.MarkRaw
 				counter      int
 				limit        int
 				oldGCPercent int
@@ -256,8 +256,8 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 			b.Run(groupName+"/Slab", func(b *testing.B) {
 				type Block struct{ data [1024]byte }
 				type benchData struct {
-					allocator    memcore.Pointer
-					ptrs         []memcore.Pointer
+					allocator    memcore.MarkRaw
+					ptrs         []memcore.MarkRaw
 					capacity     uint64
 					oldGCPercent int
 				}
@@ -269,7 +269,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 						a := SlabAllocatorCreate[Block](capacity)
 						return benchData{
 							allocator:    a,
-							ptrs:         make([]memcore.Pointer, 0, capacity),
+							ptrs:         make([]memcore.MarkRaw, 0, capacity),
 							capacity:     capacity,
 							oldGCPercent: old,
 						}
@@ -330,7 +330,7 @@ func BenchmarkAllocatorSuite_RealisticWorkloads(b *testing.B) {
 	// --- FixedLinear ---
 	b.Run("RequestCycle/FixedLinear", func(b *testing.B) {
 		type benchData struct {
-			allocator memcore.Pointer
+			allocator memcore.MarkRaw
 			oldGC     int
 		}
 		benchmarkWithMetrics(b,
@@ -358,7 +358,7 @@ func BenchmarkAllocatorSuite_RealisticWorkloads(b *testing.B) {
 	// --- DynamicLinear ---
 	b.Run("RequestCycle/DynamicLinear", func(b *testing.B) {
 		type benchData struct {
-			allocator memcore.Pointer
+			allocator memcore.MarkRaw
 			oldGC     int
 		}
 		benchmarkWithMetrics(b,
@@ -386,7 +386,7 @@ func BenchmarkAllocatorSuite_RealisticWorkloads(b *testing.B) {
 	// --- FixedManual ---
 	b.Run("RequestCycle/FixedManual", func(b *testing.B) {
 		type benchData struct {
-			allocator memcore.Pointer
+			allocator memcore.MarkRaw
 			oldGC     int
 		}
 		benchmarkWithMetrics(b,
@@ -437,7 +437,7 @@ func BenchmarkAllocatorSuite_MixedSizeWorkload(b *testing.B) {
 	// --- FixedLinear ---
 	b.Run("Mixed/FixedLinear", func(b *testing.B) {
 		type benchData struct {
-			allocator memcore.Pointer
+			allocator memcore.MarkRaw
 			oldGC     int
 			bytesUsed uint64
 		}
@@ -473,7 +473,7 @@ func BenchmarkAllocatorSuite_MixedSizeWorkload(b *testing.B) {
 	// --- FixedManual ---
 	b.Run("Mixed/FixedManual", func(b *testing.B) {
 		type benchData struct {
-			allocator memcore.Pointer
+			allocator memcore.MarkRaw
 			oldGC     int
 			count     int
 		}
@@ -521,8 +521,8 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 		const stride = 3
 
 		type benchData struct {
-			allocator memcore.Pointer
-			ptrs      []memcore.Pointer
+			allocator memcore.MarkRaw
+			ptrs      []memcore.MarkRaw
 			oldGC     int
 		}
 
@@ -530,7 +530,7 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
 				a := FixedManualAllocatorCreate(arenaSize)
-				ptrs := make([]memcore.Pointer, poolSize)
+				ptrs := make([]memcore.MarkRaw, poolSize)
 				for i := range ptrs {
 					ptrs[i] = FixedManualAllocatorMalloc(a, objSize, 16)
 				}
@@ -560,7 +560,7 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 		const batch = 1024
 
 		type benchData struct {
-			allocator memcore.Pointer
+			allocator memcore.MarkRaw
 			oldGC     int
 		}
 
@@ -593,8 +593,8 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 		const ops = 2048
 
 		type benchData struct {
-			allocator memcore.Pointer
-			ptrs      []memcore.Pointer
+			allocator memcore.MarkRaw
+			ptrs      []memcore.MarkRaw
 			rnd       *rand.Rand
 			oldGC     int
 		}
@@ -605,7 +605,7 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 				a := FixedManualAllocatorCreate(arenaSize)
 				return benchData{
 					allocator: a,
-					ptrs:      make([]memcore.Pointer, ops),
+					ptrs:      make([]memcore.MarkRaw, ops),
 					rnd:       rand.New(rand.NewSource(42)),
 					oldGC:     old,
 				}
@@ -613,8 +613,9 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 			func(d benchData, b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					idx := d.rnd.Intn(ops)
-					if d.ptrs[idx].IsValid() && memcore.PointerOffset(d.ptrs[idx]) != 0x0 && d.ptrs[idx].BelongsToAddressSpaceOfPointer(d.allocator) {
+					if memcore.MemcoreMarkIsValid(d.ptrs[idx]) && !memcore.MemcoreMarkOffsetIs(d.ptrs[idx], 0x0) && memcore.MemcoreMarkBelongsToRegion(d.ptrs[idx], (d.allocator)) {
 						FixedManualAllocatorFree(d.allocator, d.ptrs[idx])
+						d.ptrs[idx] = memcore.MarkRaw{}
 					} else {
 						size := uint64(objMin + d.rnd.Intn(objMax-objMin))
 						d.ptrs[idx] = FixedManualAllocatorMalloc(d.allocator, size, 16)
@@ -639,7 +640,7 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("Throughput/Size=%d", size), func(b *testing.B) {
 			type benchData struct {
-				allocator memcore.Pointer
+				allocator memcore.MarkRaw
 				oldGC     int
 			}
 			benchmarkWithMetrics(b,
@@ -668,7 +669,7 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 	// -----------------------------------------
 	b.Run("MixedSizes", func(b *testing.B) {
 		type benchData struct {
-			allocator  memcore.Pointer
+			allocator  memcore.MarkRaw
 			oldGC      int
 			blockSizes []int
 		}
@@ -704,15 +705,15 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 		const allocsPerCycle = 100
 		const avgSize = 128
 		type benchData struct {
-			allocator memcore.Pointer
+			allocator memcore.MarkRaw
 			oldGC     int
-			ptrs      []memcore.Pointer
+			ptrs      []memcore.MarkRaw
 		}
 		benchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
 				a := FixedManualAllocatorCreate(2 * 1024 * 1024)
-				ptrs := make([]memcore.Pointer, allocsPerCycle)
+				ptrs := make([]memcore.MarkRaw, allocsPerCycle)
 				return benchData{allocator: a, oldGC: old, ptrs: ptrs}
 			},
 			func(d benchData, b *testing.B) {
@@ -740,15 +741,15 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 		const preAllocCount = 1000
 		const blockSize = 128
 		type benchData struct {
-			allocator memcore.Pointer
-			ptrs      []memcore.Pointer
+			allocator memcore.MarkRaw
+			ptrs      []memcore.MarkRaw
 			oldGC     int
 		}
 		benchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
 				a := FixedManualAllocatorCreate(8 * 1024 * 1024)
-				ptrs := make([]memcore.Pointer, preAllocCount)
+				ptrs := make([]memcore.MarkRaw, preAllocCount)
 				for i := range ptrs {
 					ptrs[i] = FixedManualAllocatorMalloc(a, blockSize, 16)
 				}
@@ -780,7 +781,7 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 		const allocsPerCycle = arenaSize / allocSize
 
 		type benchData struct {
-			allocator memcore.Pointer
+			allocator memcore.MarkRaw
 			oldGC     int
 			sink      uintptr
 		}
@@ -795,7 +796,7 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					for j := 0; j < allocsPerCycle-10; j++ {
 						ptr := FixedManualAllocatorMalloc(d.allocator, allocSize, 16)
-						d.sink ^= uintptr(memcore.PointerOffset(ptr))
+						d.sink ^= uintptr(memcore.MemcoreMarkDereference(ptr))
 					}
 					FixedManualAllocatorReset(d.allocator)
 				}

@@ -32,10 +32,10 @@ func TestFixedSlabAllocator(t *testing.T) {
 func testSlabCreateAndDestroy(t *testing.T) {
 	a := SlabAllocatorCreate[testSlabStruct](128)
 
-	mustNotPanic(t, func() { memcore.MemcorePointerDereferenceObjectUnsafe[FixedSlabAllocator[testSlabStruct]](a) })
+	mustNotPanic(t, func() { memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[testSlabStruct]](a) })
 
 	SlabAllocatorDestroy[testSlabStruct](a)
-	mustPanic(t, func() { memcore.MemcorePointerDereferenceObjectUnsafe[FixedSlabAllocator[testSlabStruct]](a) })
+	mustPanic(t, func() { memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[testSlabStruct]](a) })
 
 	mustPanic(t, func() { SlabAllocatorMalloc[testSlabStruct](a) })
 	mustPanic(t, func() { SlabAllocatorCalloc[testSlabStruct](a) })
@@ -90,7 +90,7 @@ func testSlabCallocZeroesMemory(t *testing.T) {
 	defer SlabAllocatorDestroy[testSlabStruct](a)
 
 	ptr := SlabAllocatorCalloc[testSlabStruct](a)
-	p := memcore.MemcorePointerDereferenceRaw(ptr)
+	p := memcore.MemcoreMarkDereference(ptr)
 	byteSlice := unsafe.Slice((*byte)(p), unsafe.Sizeof(testSlabStruct{}))
 	commontesting.Assert(allEqual(byteSlice, 0x00), "calloc did not zero memory", "calloc zeroed", t)
 
@@ -107,7 +107,7 @@ func testSlabAllocationExhaustionPanics(t *testing.T) {
 	// Allocate all available slots
 	for i := 0; i < capacity; i++ {
 		ptr := SlabAllocatorMalloc[testSlabStruct](a)
-		commontesting.Assert(ptr != memcore.Pointer{}, "allocation failed before exhaustion", "allocation ok", t)
+		commontesting.Assert(ptr != memcore.MarkRaw{}, "allocation failed before exhaustion", "allocation ok", t)
 	}
 
 	// Next allocation should panic
@@ -124,7 +124,7 @@ func testSlabResetAllowsFullReuse(t *testing.T) {
 	a := SlabAllocatorCreate[testSlabStruct](capacity)
 	defer SlabAllocatorDestroy[testSlabStruct](a)
 
-	ptrsBeforeReset := make([]memcore.Pointer, capacity)
+	ptrsBeforeReset := make([]memcore.MarkRaw, capacity)
 	for i := 0; i < capacity; i++ {
 		ptrsBeforeReset[i] = SlabAllocatorMalloc[testSlabStruct](a)
 	}
@@ -138,16 +138,16 @@ func testSlabResetAllowsFullReuse(t *testing.T) {
 	})
 
 	// We should be able to allocate the full capacity again
-	ptrsAfterReset := make([]memcore.Pointer, capacity)
+	ptrsAfterReset := make([]memcore.MarkRaw, capacity)
 	for i := 0; i < capacity; i++ {
 		ptrsAfterReset[i] = SlabAllocatorMalloc[testSlabStruct](a)
-		commontesting.Assert(ptrsAfterReset[i] != memcore.Pointer{}, "allocation failed after reset", "re-allocation ok", t)
+		commontesting.Assert(ptrsAfterReset[i] != memcore.MarkRaw{}, "allocation failed after reset", "re-allocation ok", t)
 	}
 
 	// The sequence of pointers should be identical, as the free list is reset the same way
 	for i := 0; i < capacity; i++ {
-		addr1 := memcore.MemcorePointerDereferenceRaw(ptrsBeforeReset[i])
-		addr2 := memcore.MemcorePointerDereferenceRaw(ptrsAfterReset[i])
+		addr1 := memcore.MemcoreMarkDereference(ptrsBeforeReset[i])
+		addr2 := memcore.MemcoreMarkDereference(ptrsAfterReset[i])
 		commontesting.Assert(addr1 == addr2, "pointer mismatch after reset", "reset reuses memory predictably", t)
 	}
 }

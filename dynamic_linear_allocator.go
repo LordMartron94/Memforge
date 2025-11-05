@@ -15,7 +15,7 @@ type GrowthStrategy func(currentCap, neededCap uint64) uint64
 type DynamicLinearAllocator struct {
 	allocatorAddr  uintptr
 	dataBaseOffset uintptr
-	namespace      uint32
+	regionID       uint32
 
 	allocatorTotalSize uint64
 	dataCapBytes       uint64
@@ -27,8 +27,8 @@ type DynamicLinearAllocator struct {
 // DynamicLinearAllocatorCreate creates a new dynamic allocator in its own mmap region.
 //
 // It allocates both the header and initial arena contiguously and registers a namespace
-// for all pointers allocated within. The returned memcore.Pointer refers to the allocator header.
-func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategy memcore.FunctionID) memcore.Pointer {
+// for all pointers allocated within. The returned memcore.MarkRaw refers to the allocator header.
+func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategy memcore.FunctionID) memcore.MarkRaw {
 	headerSize := memcore.SizeOf[DynamicLinearAllocator]()
 	headerAlignedSize := alignIdxUp(headerSize, uint64(allocatorDataAddrAlignment))
 
@@ -40,16 +40,15 @@ func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategy me
 	}
 
 	allocatorAddr := uintptr(unsafe.Pointer(&mmap[0]))
-	namespace := memcore.MemcoreAddressSpaceRegister(allocatorAddr)
+	regionID := memcore.MemcoreRegionRegister(allocatorAddr, totalSize)
 
-	allocatorPtr := memcore.MemcorePointerCreate(namespace, 0, memcore.TypeOf[DynamicLinearAllocator]())
-	memcore.MemcorePointerRegister(allocatorPtr)
+	allocatorPtr := memcore.MemcoreMarkCreate(regionID, 0)
 
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[DynamicLinearAllocator](allocatorPtr)
+	header := memcore.MemcoreMarkDereferenceObject[DynamicLinearAllocator](allocatorPtr)
 	*header = DynamicLinearAllocator{
 		allocatorAddr:      allocatorAddr,
 		dataBaseOffset:     uintptr(headerAlignedSize),
-		namespace:          namespace,
+		regionID:           regionID,
 		allocatorTotalSize: totalSize,
 		dataCapBytes:       initialCapacityBytes,
 		dataByteIdx:        0,
@@ -63,11 +62,11 @@ func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategy me
 
 // DynamicLinearAllocatorDestroy releases all memory and unregisters all pointers.
 // After this call, the allocator is invalid and may not be reused.
-func DynamicLinearAllocatorDestroy(allocator memcore.Pointer) {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[DynamicLinearAllocator](allocator)
+func DynamicLinearAllocatorDestroy(allocator memcore.MarkRaw) {
+	header := memcore.MemcoreMarkDereferenceObject[DynamicLinearAllocator](allocator)
 
 	memforgeAllocatorDestroy(allocator)
-	memcore.MemcoreAddressSpaceUnregister(header.namespace)
+	memcore.MemcoreRegionUnregister(header.regionID)
 
 	if err := memcore.MemmapUnmapAt(unsafe.Pointer(header.allocatorAddr), int(header.allocatorTotalSize)); err != nil {
 		panic(fmt.Errorf("failed to destroy dynamic allocator: %w", err))
@@ -75,11 +74,11 @@ func DynamicLinearAllocatorDestroy(allocator memcore.Pointer) {
 }
 
 // DynamicLinearAllocatorMalloc allocates a block of memory from the dynamic allocator.
-// Returns a memcore.Pointer inside the allocator’s namespace.
+// Returns a memcore.MarkRaw inside the allocator’s namespace.
 //
 //go:nosplit
-func DynamicLinearAllocatorMalloc(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[DynamicLinearAllocator](allocator)
+func DynamicLinearAllocatorMalloc(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
+	header := memcore.MemcoreMarkDereferenceObject[DynamicLinearAllocator](allocator)
 	alignmentValidate(alignment)
 
 	alignedIdx := dynamicLinearAllocatorDataIdxGet(header, alignment)
@@ -88,8 +87,7 @@ func DynamicLinearAllocatorMalloc(allocator memcore.Pointer, sizeBytes, alignmen
 	}
 
 	offset := uintptr(alignedIdx)
-	ptr := memcore.MemcorePointerCreate(header.namespace, offset, memcore.TypeOf[byte]())
-	memcore.MemcorePointerRegister(ptr)
+	ptr := memcore.MemcoreMarkOffsetFrom(allocator, offset)
 
 	memforgeAllocationAdd(allocator, ptr, sizeBytes)
 	dynamicLinearAllocatorIdxUpdate(header, alignedIdx, sizeBytes)
@@ -99,8 +97,8 @@ func DynamicLinearAllocatorMalloc(allocator memcore.Pointer, sizeBytes, alignmen
 // DynamicLinearAllocatorMallocUnsafe allocates memory without validation.
 //
 //go:nosplit
-func DynamicLinearAllocatorMallocUnsafe(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[DynamicLinearAllocator](allocator)
+func DynamicLinearAllocatorMallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
+	header := memcore.MemcoreMarkDereferenceObject[DynamicLinearAllocator](allocator)
 
 	alignedIdx := dynamicLinearAllocatorDataIdxGet(header, alignment)
 	if !dynamicLinearAllocatorCapacityGuarantee(header, sizeBytes, alignedIdx) {
@@ -108,8 +106,7 @@ func DynamicLinearAllocatorMallocUnsafe(allocator memcore.Pointer, sizeBytes, al
 	}
 
 	offset := uintptr(alignedIdx)
-	ptr := memcore.MemcorePointerCreate(header.namespace, offset, memcore.TypeOf[byte]())
-	memcore.MemcorePointerRegister(ptr)
+	ptr := memcore.MemcoreMarkOffsetFrom(allocator, offset)
 
 	memforgeAllocationAdd(allocator, ptr, sizeBytes)
 	dynamicLinearAllocatorIdxUpdate(header, alignedIdx, sizeBytes)
@@ -119,47 +116,45 @@ func DynamicLinearAllocatorMallocUnsafe(allocator memcore.Pointer, sizeBytes, al
 // DynamicLinearAllocatorCalloc allocates and zeroes memory.
 //
 //go:nosplit
-func DynamicLinearAllocatorCalloc(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
+func DynamicLinearAllocatorCalloc(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	ptr := DynamicLinearAllocatorMalloc(allocator, sizeBytes, alignment)
-	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(sizeBytes))
+	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(sizeBytes))
 	return ptr
 }
 
 // DynamicLinearAllocatorCallocUnsafe allocates and zeroes memory without validation.
 //
 //go:nosplit
-func DynamicLinearAllocatorCallocUnsafe(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
+func DynamicLinearAllocatorCallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	ptr := DynamicLinearAllocatorMallocUnsafe(allocator, sizeBytes, alignment)
-	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(sizeBytes))
+	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(sizeBytes))
 	return ptr
 }
 
 // DynamicLinearAllocatorMallocObject allocates a typed object.
-func DynamicLinearAllocatorMallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
+// It also returns the allocation interpreted as *T which is not safe to store inside manually allocated memory.
+func DynamicLinearAllocatorMallocObject[T any](allocator memcore.MarkRaw) (memcore.MarkRaw, *T) {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
 	ptr := DynamicLinearAllocatorMalloc(allocator, size, align)
-	memcore.MemcorePointerUpdateType(ptr, memcore.TypeOf[T]())
-	return ptr
+	return ptr, memcore.MemcoreMarkDereferenceObject[T](ptr)
 }
 
 // DynamicLinearAllocatorCallocObject allocates a zeroed typed object.
-func DynamicLinearAllocatorCallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
+// It also returns the allocation interpreted as *T which is not safe to store inside manually allocated memory.
+func DynamicLinearAllocatorCallocObject[T any](allocator memcore.MarkRaw) (memcore.MarkRaw, *T) {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
 	ptr := DynamicLinearAllocatorCalloc(allocator, size, align)
-	memcore.MemcorePointerUpdateType(ptr, memcore.TypeOf[T]())
-	return ptr
+	return ptr, memcore.MemcoreMarkDereferenceObject[T](ptr)
 }
 
 // DynamicLinearAllocatorReset resets the allocator, allowing reuse.
 // All pointers within the namespace are unregistered.
 // Using them afterward is undefined behaviour.
-func DynamicLinearAllocatorReset(allocator memcore.Pointer) {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[DynamicLinearAllocator](allocator)
+func DynamicLinearAllocatorReset(allocator memcore.MarkRaw) {
+	header := memcore.MemcoreMarkDereferenceObject[DynamicLinearAllocator](allocator)
 	memforgeAllocatorRemoveAll(allocator)
-	memcore.MemcoreAddressSpaceClearPointers(header.namespace)
-	memcore.MemcorePointerRegister(allocator)
 	header.dataByteIdx = 0
 }
 
@@ -169,7 +164,7 @@ func DynamicLinearAllocatorReset(allocator memcore.Pointer) {
 func dynamicLinearAllocatorGrow(header *DynamicLinearAllocator, neededCapacityBytes uint64) *DynamicLinearAllocator {
 	prev := *header
 
-	strategy := memcore.MemcoreFunctionGetTyped[GrowthStrategy](prev.growthStrategyID)
+	strategy := memcore.MemcoreFunctionRetrieveTyped[GrowthStrategy](prev.growthStrategyID)
 	newSize := strategy(prev.dataCapBytes, neededCapacityBytes)
 	if newSize < neededCapacityBytes {
 		panic("growth strategy returned invalid new size")
@@ -198,7 +193,7 @@ func dynamicLinearAllocatorGrow(header *DynamicLinearAllocator, neededCapacityBy
 	newHeaderPtr.allocatorTotalSize = newTotal
 	newHeaderPtr.dataCapBytes = newSize
 
-	memcore.MemcorePointerBaseAddressUpdate(newHeaderPtr.namespace, newBaseAddr)
+	memcore.MemcoreRegionBaseUpdate(newHeaderPtr.regionID, newBaseAddr)
 	return newHeaderPtr
 }
 

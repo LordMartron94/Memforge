@@ -7,7 +7,7 @@ import (
 	"unsafe"
 )
 
-// FixedLinearAllocator is a fixed-size bump allocator built entirely on top of memcore.Pointer.
+// FixedLinearAllocator is a fixed-size bump allocator built entirely on top of memcore.MarkRaw.
 //
 // The allocator maintains a namespace containing:
 //   - Its own header (this struct)
@@ -21,7 +21,7 @@ type FixedLinearAllocator struct {
 	allocatorAddr      uintptr
 	allocatorTotalSize uint64
 	dataBaseOffset     uintptr
-	namespace          uint32
+	regionID           uint32
 	dataByteIdx        uint64
 	dataCapBytes       uint64
 }
@@ -30,8 +30,8 @@ type FixedLinearAllocator struct {
 // Both the header and its managed memory live in the same mapped space.
 //
 // The allocator automatically registers a namespace for all future allocations.
-// On success, it returns a `memcore.Pointer` to the allocator header itself.
-func FixedLinearAllocatorCreate(sizeBytes int) memcore.Pointer {
+// On success, it returns a `memcore.MarkRaw` to the allocator header itself.
+func FixedLinearAllocatorCreate(sizeBytes int) memcore.MarkRaw {
 	headerSize := memcore.SizeOf[FixedLinearAllocator]()
 	headerAlignedSize := alignIdxUp(uint64(headerSize), uint64(allocatorDataAddrAlignment))
 
@@ -45,17 +45,16 @@ func FixedLinearAllocatorCreate(sizeBytes int) memcore.Pointer {
 	allocatorPtrRaw := unsafe.Pointer(&mmap[0])
 	allocatorAddr := uintptr(allocatorPtrRaw)
 
-	addressSpace := memcore.MemcoreAddressSpaceRegister(allocatorAddr)
+	regionID := memcore.MemcoreRegionRegister(allocatorAddr, totalSize)
 
-	allocatorPtr := memcore.MemcorePointerCreate(addressSpace, 0, memcore.TypeOf[FixedLinearAllocator]())
-	memcore.MemcorePointerRegister(allocatorPtr)
+	allocatorPtr := memcore.MemcoreMarkCreate(regionID, 0)
 
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedLinearAllocator](allocatorPtr)
+	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](allocatorPtr)
 	*header = FixedLinearAllocator{
 		allocatorAddr:      allocatorAddr,
 		allocatorTotalSize: totalSize,
 		dataBaseOffset:     uintptr(headerAlignedSize),
-		namespace:          addressSpace,
+		regionID:           regionID,
 		dataByteIdx:        0,
 		dataCapBytes:       uint64(sizeBytes),
 	}
@@ -67,12 +66,12 @@ func FixedLinearAllocatorCreate(sizeBytes int) memcore.Pointer {
 
 // FixedLinearAllocatorDestroy unmaps and unregisters the allocator and all its allocations.
 // Do NOT use the allocator after calling this.
-func FixedLinearAllocatorDestroy(allocator memcore.Pointer) {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedLinearAllocator](allocator)
+func FixedLinearAllocatorDestroy(allocator memcore.MarkRaw) {
+	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](allocator)
 
 	memforgeAllocatorDestroy(allocator)
 
-	memcore.MemcoreAddressSpaceUnregister(header.namespace)
+	memcore.MemcoreRegionUnregister(header.regionID)
 
 	if err := memcore.MemmapUnmapAt(unsafe.Pointer(header.allocatorAddr), int(header.allocatorTotalSize)); err != nil {
 		panic(fmt.Errorf("failed to destroy allocator: %w", err))
@@ -85,12 +84,12 @@ func fixedLinearAllocatorOOMError(allocator *FixedLinearAllocator, requestedSize
 }
 
 // FixedLinearAllocatorMalloc allocates `sizeBytes` bytes of memory with the given alignment.
-// Returns a memcore.Pointer inside the allocator's namespace.
+// Returns a memcore.MarkRaw inside the allocator's namespace.
 // The memory is not zeroed.
 //
 //go:nosplit
-func FixedLinearAllocatorMalloc(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedLinearAllocator](allocator)
+func FixedLinearAllocatorMalloc(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
+	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](allocator)
 	alignmentValidate(alignment)
 
 	alignedIdx := fixedLinearAllocatorDataIdxGet(header, alignment)
@@ -99,8 +98,7 @@ func FixedLinearAllocatorMalloc(allocator memcore.Pointer, sizeBytes, alignment 
 	}
 
 	offset := uintptr(alignedIdx)
-	ptr := memcore.MemcorePointerCreate(header.namespace, offset, memcore.TypeOf[byte]())
-	memcore.MemcorePointerRegister(ptr)
+	ptr := memcore.MemcoreMarkOffsetFrom(allocator, offset)
 
 	memforgeAllocationAdd(allocator, ptr, sizeBytes)
 
@@ -111,8 +109,8 @@ func FixedLinearAllocatorMalloc(allocator memcore.Pointer, sizeBytes, alignment 
 // FixedLinearAllocatorMallocUnsafe allocates memory without validation.
 //
 //go:nosplit
-func FixedLinearAllocatorMallocUnsafe(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedLinearAllocator](allocator)
+func FixedLinearAllocatorMallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
+	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](allocator)
 	alignedIdx := fixedLinearAllocatorDataIdxGet(header, alignment)
 
 	if !fixedLinearAllocatorCapacityGuarantee(header, sizeBytes, alignedIdx) {
@@ -120,8 +118,7 @@ func FixedLinearAllocatorMallocUnsafe(allocator memcore.Pointer, sizeBytes, alig
 	}
 
 	offset := uintptr(alignedIdx)
-	ptr := memcore.MemcorePointerCreate(header.namespace, offset, memcore.TypeOf[byte]())
-	memcore.MemcorePointerRegister(ptr)
+	ptr := memcore.MemcoreMarkOffsetFrom(allocator, offset)
 
 	memforgeAllocationAdd(allocator, ptr, sizeBytes)
 	fixedLinearAllocatorIdxUpdate(header, alignedIdx, sizeBytes)
@@ -130,39 +127,39 @@ func FixedLinearAllocatorMallocUnsafe(allocator memcore.Pointer, sizeBytes, alig
 }
 
 // FixedLinearAllocatorCalloc allocates and zeroes memory.
-func FixedLinearAllocatorCalloc(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
+func FixedLinearAllocatorCalloc(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	ptr := FixedLinearAllocatorMalloc(allocator, sizeBytes, alignment)
-	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(sizeBytes))
+	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(sizeBytes))
 	return ptr
 }
 
 // FixedLinearAllocatorCallocUnsafe allocates and zeroes memory without validation.
 //
 //go:nosplit
-func FixedLinearAllocatorCallocUnsafe(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
+func FixedLinearAllocatorCallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	ptr := FixedLinearAllocatorMallocUnsafe(allocator, sizeBytes, alignment)
-	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(sizeBytes))
+	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(sizeBytes))
 	return ptr
 }
 
 // FixedLinearAllocatorMallocObject allocates and returns a typed object.
-// It returns a memcore.Pointer to the object, properly aligned.
-func FixedLinearAllocatorMallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
+// It returns a memcore.MarkRaw to the object, properly aligned.
+// It also returns the object interpreted as *T but this is not safe to store inside manually allocated memory.
+func FixedLinearAllocatorMallocObject[T any](allocator memcore.MarkRaw) (memcore.MarkRaw, *T) {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
 	ptr := FixedLinearAllocatorMalloc(allocator, size, align)
-	memcore.MemcorePointerUpdateType(ptr, memcore.TypeOf[T]())
-	return ptr
+	return ptr, memcore.MemcoreMarkDereferenceObject[T](ptr)
 }
 
 // FixedLinearAllocatorCallocObject allocates a zeroed typed object.
-// It returns a memcore.Pointer to the object.
-func FixedLinearAllocatorCallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
+// It returns a memcore.MarkRaw to the object.
+// It also returns the object interpreted as *T but this is not safe to store inside manually allocated memory.
+func FixedLinearAllocatorCallocObject[T any](allocator memcore.MarkRaw) (memcore.MarkRaw, *T) {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
 	ptr := FixedLinearAllocatorCalloc(allocator, size, align)
-	memcore.MemcorePointerUpdateType(ptr, memcore.TypeOf[T]())
-	return ptr
+	return ptr, memcore.MemcoreMarkDereferenceObject[T](ptr)
 }
 
 // FixedLinearAllocatorReset resets the allocator’s bump index,
@@ -170,11 +167,9 @@ func FixedLinearAllocatorCallocObject[T any](allocator memcore.Pointer) memcore.
 //
 // All previously allocated pointers are unregistered.
 // Using them afterward is undefined behaviour.
-func FixedLinearAllocatorReset(allocator memcore.Pointer) {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedLinearAllocator](allocator)
+func FixedLinearAllocatorReset(allocator memcore.MarkRaw) {
+	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](allocator)
 	memforgeAllocatorRemoveAll(allocator)
-	memcore.MemcoreAddressSpaceClearPointers(header.namespace)
-	memcore.MemcorePointerRegister(allocator)
 
 	header.dataByteIdx = 0
 }

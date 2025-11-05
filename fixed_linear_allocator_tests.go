@@ -24,7 +24,6 @@ func TestLinearAllocator(t *testing.T) {
 func testCreateAndDestroy(t *testing.T) {
 	const sz = 4096
 	a := FixedLinearAllocatorCreate(sz)
-	foundationTesting.Assert(a.IsValid(), "allocator pointer invalid after create", "allocator created", t)
 	FixedLinearAllocatorDestroy(a)
 	mustPanic(t, func() { _ = FixedLinearAllocatorMalloc(a, 8, 8) })
 	mustPanic(t, func() { FixedLinearAllocatorReset(a) })
@@ -39,8 +38,8 @@ func testMallocAlignmentAndBump(t *testing.T) {
 	p1 := FixedLinearAllocatorMalloc(a, 24, 8)
 	p2 := FixedLinearAllocatorMalloc(a, 32, 16)
 
-	r1 := memcore.MemcorePointerDereferenceRaw(p1)
-	r2 := memcore.MemcorePointerDereferenceRaw(p2)
+	r1 := memcore.MemcoreMarkDereference(p1)
+	r2 := memcore.MemcoreMarkDereference(p2)
 
 	foundationTesting.Assert(uintptr(r1)%8 == 0, fmt.Sprintf("p1 not 8-byte aligned: %v", r1), "p1 aligned to 8", t)
 	foundationTesting.Assert(uintptr(r2)%16 == 0, fmt.Sprintf("p2 not 16-byte aligned: %v", r2), "p2 aligned to 16", t)
@@ -73,12 +72,8 @@ func testZeroSizeAllocationNoBump(t *testing.T) {
 	p0b := FixedLinearAllocatorMalloc(a, 0, 64)
 	pReal := FixedLinearAllocatorMalloc(a, 32, 64)
 
-	addr0 := memcore.PointerOffset(p0)
-	addr0b := memcore.PointerOffset(p0b)
-	addrReal := memcore.PointerOffset(pReal)
-
-	foundationTesting.Assert(addr0 == addr0b, "zero-size bumped index", "zero-size stable", t)
-	foundationTesting.Assert(addr0 == addrReal, "real alloc not reused", "real alloc reused", t)
+	foundationTesting.Assert(p0 == p0b, "zero-size bumped index", "zero-size stable", t)
+	foundationTesting.Assert(p0 == pReal, "real alloc not reused", "real alloc reused", t)
 }
 
 func testCallocZeroes(t *testing.T) {
@@ -87,7 +82,7 @@ func testCallocZeroes(t *testing.T) {
 	defer FixedLinearAllocatorDestroy(a)
 
 	p := FixedLinearAllocatorCalloc(a, 128, 8)
-	r := memcore.MemcorePointerDereferenceRaw(p)
+	r := memcore.MemcoreMarkDereference(p)
 	b := unsafe.Slice((*byte)(r), 128)
 
 	foundationTesting.Assert(allEqual(b, 0x00), "calloc memory not zeroed", "calloc zeroed", t)
@@ -101,15 +96,13 @@ func testResetAllowsReuse(t *testing.T) {
 	defer FixedLinearAllocatorDestroy(a)
 
 	p1 := FixedLinearAllocatorMalloc(a, 64, 32)
-	addr1 := memcore.PointerOffset(p1)
 
 	_ = FixedLinearAllocatorMalloc(a, 128, 64)
 	FixedLinearAllocatorReset(a)
 
 	p1b := FixedLinearAllocatorMalloc(a, 64, 32)
-	addr1b := memcore.PointerOffset(p1b)
 
-	foundationTesting.Assert(addr1 == addr1b, "reset did not reuse", "reset reused", t)
+	foundationTesting.Assert(p1 == p1b, "reset did not reuse", "reset reused", t)
 }
 
 func testInvalidAlignmentPanics(t *testing.T) {
@@ -130,15 +123,11 @@ func testMallocAndCallocObject(t *testing.T) {
 	a := FixedLinearAllocatorCreate(4096)
 	defer FixedLinearAllocatorDestroy(a)
 
-	obj := memcore.MemcorePointerDereferenceObjectUnsafe[pod](
-		FixedLinearAllocatorMallocObject[pod](a),
-	)
+	_, obj := FixedLinearAllocatorMallocObject[pod](a)
 	obj.A, obj.B, obj.C, obj.D = 1, 2, 3, 4
 	foundationTesting.Assert(obj.D == 4, "malloc object mismatch", "malloc ok", t)
 
-	obj2 := memcore.MemcorePointerDereferenceObjectUnsafe[pod](
-		FixedLinearAllocatorCallocObject[pod](a),
-	)
+	_, obj2 := FixedLinearAllocatorCallocObject[pod](a)
 	foundationTesting.Assert(obj2.A == 0, "calloc not zeroed", "calloc ok", t)
 	foundationTesting.Assert(obj != obj2, "malloc and calloc returned same addr", "distinct objects", t)
 }

@@ -5,6 +5,8 @@ package memforge
 import (
 	"fmt"
 	"memcore"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -36,7 +38,8 @@ const (
 	bgGreen  = "\033[42m"
 )
 
-var debugStats = make(map[memcore.Pointer]*allocatorStats)
+var debugStats = make(map[memcore.MarkRaw]*allocatorStats)
+var internalPrefixes = []string{"runtime.", "reflect.", "memcore.", "testing.", "memforge.test"}
 
 type allocatorStats struct {
 	allocatorName                                        string
@@ -49,22 +52,54 @@ type allocatorStats struct {
 }
 
 type allocation struct {
-	ptr       memcore.Pointer
+	ptr       memcore.MarkRaw
 	sizeBytes uint64
 	timestamp time.Time
+	creator   string
+}
+
+// memforgeCaptureCallStack returns a formatted call stack string for debugging.
+// It skips internal frames and formats each frame as "Func → Func → Func".
+func memforgeCaptureCallStack(skip int) string {
+	const maxDepth = 16
+	var pcs [maxDepth]uintptr
+	n := runtime.Callers(skip+2, pcs[:]) // skip runtime + helper itself
+	frames := runtime.CallersFrames(pcs[:n])
+
+	stack := make([]string, 0, n)
+	for {
+		f, more := frames.Next()
+		if !isInternalFrame(f.Function) {
+			stack = append(stack, filepath.Base(f.Function))
+		}
+		if !more {
+			break
+		}
+	}
+	slices.Reverse(stack)
+	return strings.Join(stack, " → ")
+}
+
+func isInternalFrame(fn string) bool {
+	for _, p := range internalPrefixes {
+		if strings.Contains(fn, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // Register a new allocator and record its creation site.
-func memforgeAllocatorRegister(allocatorPtr memcore.Pointer, name string) {
+func memforgeAllocatorRegister(allocatorPtr memcore.MarkRaw, name string) {
 	debugStats[allocatorPtr] = &allocatorStats{
 		allocatorName: name,
 		createdAt:     time.Now(),
-		creator:       allocatorPtr.CallStack(),
+		creator:       memforgeCaptureCallStack(2),
 	}
 }
 
 // Record a new allocation in the debug tracker.
-func memforgeAllocationAdd(allocatorPtr, allocationPtr memcore.Pointer, sizeBytes uint64) {
+func memforgeAllocationAdd(allocatorPtr, allocationPtr memcore.MarkRaw, sizeBytes uint64) {
 	stats := debugStats[allocatorPtr]
 	if stats == nil {
 		return
@@ -74,6 +109,7 @@ func memforgeAllocationAdd(allocatorPtr, allocationPtr memcore.Pointer, sizeByte
 		ptr:       allocationPtr,
 		sizeBytes: sizeBytes,
 		timestamp: time.Now(),
+		creator:   memforgeCaptureCallStack(2),
 	}
 	stats.allAllocations = append(stats.allAllocations, entry)
 	stats.currentlyLiveAllocations = append(stats.currentlyLiveAllocations, entry)
@@ -89,7 +125,7 @@ func memforgeAllocationAdd(allocatorPtr, allocationPtr memcore.Pointer, sizeByte
 }
 
 // Remove a single freed allocation.
-func memforgeAllocationRemove(allocatorPtr, allocationPtr memcore.Pointer) {
+func memforgeAllocationRemove(allocatorPtr, allocationPtr memcore.MarkRaw) {
 	stats := debugStats[allocatorPtr]
 	if stats == nil {
 		return
@@ -105,14 +141,14 @@ func memforgeAllocationRemove(allocatorPtr, allocationPtr memcore.Pointer) {
 }
 
 // Marks an allocator as destroyed.
-func memforgeAllocatorDestroy(allocatorPtr memcore.Pointer) {
+func memforgeAllocatorDestroy(allocatorPtr memcore.MarkRaw) {
 	memforgeAllocatorRemoveAll(allocatorPtr)
 	stats := debugStats[allocatorPtr]
 	stats.destroyed = true
 }
 
 // Remove all allocations for an allocator.
-func memforgeAllocatorRemoveAll(allocatorPtr memcore.Pointer) {
+func memforgeAllocatorRemoveAll(allocatorPtr memcore.MarkRaw) {
 	stats := debugStats[allocatorPtr]
 	if stats == nil {
 		return
@@ -261,15 +297,15 @@ func writeGlobalSummary(sb *strings.Builder, totals globalTotals, typeCount, all
 	sb.WriteString(fmt.Sprintf("%s└%s\n\n", colorBoldWhite, strings.Repeat("─", boxWidth-1)))
 }
 
-func groupAllocatorsByType(stats map[memcore.Pointer]*allocatorStats) map[string][]memcore.Pointer {
-	group := make(map[string][]memcore.Pointer)
+func groupAllocatorsByType(stats map[memcore.MarkRaw]*allocatorStats) map[string][]memcore.MarkRaw {
+	group := make(map[string][]memcore.MarkRaw)
 	for ptr, st := range stats {
 		group[st.allocatorName] = append(group[st.allocatorName], ptr)
 	}
 	return group
 }
 
-func sortedTypeNames(group map[string][]memcore.Pointer) []string {
+func sortedTypeNames(group map[string][]memcore.MarkRaw) []string {
 	names := make([]string, 0, len(group))
 	for name := range group {
 		names = append(names, name)
@@ -278,7 +314,7 @@ func sortedTypeNames(group map[string][]memcore.Pointer) []string {
 	return names
 }
 
-func computeTypeTotals(ptrs []memcore.Pointer) globalTotals {
+func computeTypeTotals(ptrs []memcore.MarkRaw) globalTotals {
 	var totals globalTotals
 	for _, p := range ptrs {
 		st := debugStats[p]
@@ -290,7 +326,7 @@ func computeTypeTotals(ptrs []memcore.Pointer) globalTotals {
 	return totals
 }
 
-func writeTypeSummary(sb *strings.Builder, name string, ptrs []memcore.Pointer, totals globalTotals) {
+func writeTypeSummary(sb *strings.Builder, name string, ptrs []memcore.MarkRaw, totals globalTotals) {
 	const boxWidth = 100
 
 	destroyedCount := 0
@@ -351,7 +387,7 @@ func writeTypeSummary(sb *strings.Builder, name string, ptrs []memcore.Pointer, 
 	sb.WriteString(fmt.Sprintf("%s└%s%s\n\n", colorYellow, strings.Repeat("─", boxWidth-1), colorReset))
 }
 
-func writeAllocatorSummary(sb *strings.Builder, addr memcore.Pointer, isLast bool) {
+func writeAllocatorSummary(sb *strings.Builder, addr memcore.MarkRaw, isLast bool) {
 	st := debugStats[addr]
 	if len(st.allAllocations) == 0 {
 		return
@@ -367,7 +403,7 @@ func writeAllocatorSummary(sb *strings.Builder, addr memcore.Pointer, isLast boo
 	if st.destroyed {
 		allocVal = fmt.Sprintf("%s<destroyed>%s", colorGray, colorReset)
 	} else {
-		allocVal = fmt.Sprintf("%s0x%016x%s", colorBlue, memcore.MemcorePointerDereferenceRaw(addr), colorReset)
+		allocVal = fmt.Sprintf("%s0x%016x%s", colorBlue, memcore.MemcoreMarkDereference(addr), colorReset)
 	}
 
 	// Status and icon
@@ -449,13 +485,13 @@ func writeLiveAllocations(sb *strings.Builder, allocs []allocation) {
 			colorYellow, colorReset,
 			colorRed, colorReset,
 			colorWhite, colorReset,
-			colorBlue, memcore.MemcorePointerDereferenceRaw(a.ptr), colorReset,
+			colorBlue, memcore.MemcoreMarkDereference(a.ptr), colorReset,
 			colorWhite, colorReset,
 			colorMagenta, humanBytes(float64(a.sizeBytes)), colorReset,
 			colorGray, formatDuration(age), colorReset))
 
 		// Callstack for allocation
-		callstackLines := strings.Split(a.ptr.CallStack(), "\n")
+		callstackLines := strings.Split(a.creator, " → ")
 		for j, line := range callstackLines {
 			if j == 0 {
 				sb.WriteString(fmt.Sprintf("%s│%s          %s%s%s\n",

@@ -3,7 +3,7 @@ package memforge
 import (
 	"fmt"
 	"memcore"
-	"memcore/primitives"
+	"memstruct"
 	"unsafe"
 )
 
@@ -11,7 +11,7 @@ const allocatorFailureCountResetHeuristic uint8 = 5
 
 // allocationRecord stores metadata for a single active allocation.
 type allocationRecord struct {
-	ptr       memcore.Pointer
+	ptr       memcore.MarkRaw
 	sizeBytes uint64
 }
 
@@ -22,7 +22,7 @@ type freeMemoryRegionBlock struct {
 }
 
 // FixedManualAllocator provides low-level manual allocation/freeing
-// within a fixed-size memory-mapped region. It uses `memcore.Pointer`
+// within a fixed-size memory-mapped region. It uses `memcore.MarkRaw`
 // as the single authoritative representation of all allocations.
 //
 // Characteristics:
@@ -38,9 +38,9 @@ type FixedManualAllocator struct {
 	addressSpace        uint32
 	storage             memcore.MemoryMap
 
-	metadataAllocator memcore.Pointer // FixedLinearAllocator
-	freeMemory        memcore.Pointer // FixedOrderedList[freeMemoryRegionBlock]
-	ptrRefs           memcore.Pointer // FixedOrderedList[allocationRecord]
+	metadataAllocator memcore.MarkRaw // FixedLinearAllocator
+	freeMemory        memcore.MarkRaw // FixedOrderedList[freeMemoryRegionBlock]
+	ptrRefs           memcore.MarkRaw // FixedOrderedList[allocationRecord]
 
 	dataBytesCap          uint64
 	regionIdxAreaHint     uint64
@@ -51,7 +51,7 @@ type FixedManualAllocator struct {
 
 // FixedManualAllocatorCreate creates a new manual allocator managing
 // `sizeBytes` of memory.
-func FixedManualAllocatorCreate(sizeBytes uint64) memcore.Pointer {
+func FixedManualAllocatorCreate(sizeBytes uint64) memcore.MarkRaw {
 	headerSize := memcore.SizeOf[FixedManualAllocator]()
 	headerAlignedSize := alignIdxUp(uint64(headerSize), uint64(allocatorDataAddrAlignment))
 
@@ -65,12 +65,11 @@ func FixedManualAllocatorCreate(sizeBytes uint64) memcore.Pointer {
 	allocatorPtrRaw := unsafe.Pointer(&mmap[0])
 	allocatorAddr := uintptr(allocatorPtrRaw)
 
-	addressSpace := memcore.MemcoreAddressSpaceRegister(allocatorAddr)
+	regionID := memcore.MemcoreRegionRegister(allocatorAddr, totalSize)
 
 	// Allocate and register allocator header pointer
-	allocatorPtr := memcore.MemcorePointerCreate(addressSpace, 0, memcore.TypeOf[FixedManualAllocator]())
-	memcore.MemcorePointerRegister(allocatorPtr)
-	allocator := memcore.MemcorePointerDereferenceObjectUnsafe[FixedManualAllocator](allocatorPtr)
+	allocatorPtr := memcore.MemcoreMarkCreate(regionID, 0)
+	allocator := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocatorPtr)
 
 	// Determine metadata capacity heuristics
 	minTrack := memcore.SizeOf[uintptr]()
@@ -80,24 +79,22 @@ func FixedManualAllocatorCreate(sizeBytes uint64) memcore.Pointer {
 	maxAllocs := sizeBytes / uint64(minTrack)
 
 	// Allocate metadata arena
-	ptrRefBytes := alignIdxUp(primitives.FixedOrderedListRequiredBytes[allocationRecord](maxAllocs), primitives.FixedOrderedListRequiredAlignment[allocationRecord]())
-	freeListBytes := alignIdxUp(primitives.FixedOrderedListRequiredBytes[freeMemoryRegionBlock](maxAllocs), primitives.FixedOrderedListRequiredAlignment[freeMemoryRegionBlock]())
+	ptrRefBytes := alignIdxUp(memstruct.FixedOrderedListRequiredBytes[allocationRecord](maxAllocs), memstruct.FixedOrderedListRequiredAlignment[allocationRecord]())
+	freeListBytes := alignIdxUp(memstruct.FixedOrderedListRequiredBytes[freeMemoryRegionBlock](maxAllocs), memstruct.FixedOrderedListRequiredAlignment[freeMemoryRegionBlock]())
 	metaBytes := ptrRefBytes + freeListBytes
 	metaAlloc := FixedLinearAllocatorCreate(int(metaBytes))
 
 	// Allocate list memory
-	ptrRefsPtr := FixedLinearAllocatorMalloc(metaAlloc, ptrRefBytes, memcore.AlignOf[primitives.FixedOrderedList[allocationRecord]]())
-	memcore.MemcorePointerUpdateType(ptrRefsPtr, memcore.TypeOf[primitives.FixedOrderedList[allocationRecord]]())
+	ptrRefsPtr := FixedLinearAllocatorMalloc(metaAlloc, ptrRefBytes, memcore.AlignOf[memstruct.FixedOrderedList[allocationRecord]]())
 
-	freeListPtr := FixedLinearAllocatorMalloc(metaAlloc, freeListBytes, memcore.AlignOf[primitives.FixedOrderedList[freeMemoryRegionBlock]]())
-	memcore.MemcorePointerUpdateType(freeListPtr, memcore.TypeOf[primitives.FixedOrderedList[freeMemoryRegionBlock]]())
+	freeListPtr := FixedLinearAllocatorMalloc(metaAlloc, freeListBytes, memcore.AlignOf[memstruct.FixedOrderedList[freeMemoryRegionBlock]]())
 
 	// Initialize metadata lists
-	primitives.FixedOrderedListInitializeAt[allocationRecord](ptrRefsPtr, maxAllocs)
-	primitives.FixedOrderedListInitializeAt[freeMemoryRegionBlock](freeListPtr, maxAllocs)
+	memstruct.FixedOrderedListInitializeAt[allocationRecord](ptrRefsPtr, maxAllocs)
+	memstruct.FixedOrderedListInitializeAt[freeMemoryRegionBlock](freeListPtr, maxAllocs)
 
 	// Initialize full free region
-	primitives.FixedOrderedListAppendUnsafe(freeListPtr, freeMemoryRegionBlock{
+	memstruct.FixedOrderedListAppendUnsafe(freeListPtr, freeMemoryRegionBlock{
 		memStartIdx: 0,
 		sizeBytes:   sizeBytes,
 	})
@@ -107,7 +104,7 @@ func FixedManualAllocatorCreate(sizeBytes uint64) memcore.Pointer {
 		allocatorAddr:         allocatorAddr,
 		dataRegionOffset:      uintptr(headerAlignedSize),
 		allocatorRegionSize:   totalSize,
-		addressSpace:          addressSpace,
+		addressSpace:          regionID,
 		storage:               mmap,
 		metadataAllocator:     metaAlloc,
 		freeMemory:            freeListPtr,
@@ -125,15 +122,12 @@ func FixedManualAllocatorCreate(sizeBytes uint64) memcore.Pointer {
 // unregistering its namespace and invalidating all pointers created from it.
 //
 // Using the allocator after destruction will panic.
-func FixedManualAllocatorDestroy(allocator memcore.Pointer) {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedManualAllocator](allocator)
+func FixedManualAllocatorDestroy(allocator memcore.MarkRaw) {
+	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 
 	memforgeAllocatorDestroy(allocator)
 
-	primitives.FixedOrderedListDestroy[freeMemoryRegionBlock](header.freeMemory)
-	primitives.FixedOrderedListDestroy[allocationRecord](header.ptrRefs)
-
-	memcore.MemcoreAddressSpaceUnregister(header.addressSpace)
+	memcore.MemcoreRegionUnregister(header.addressSpace)
 
 	FixedLinearAllocatorDestroy(header.metadataAllocator)
 
@@ -145,12 +139,12 @@ func FixedManualAllocatorDestroy(allocator memcore.Pointer) {
 // ---------------------------------- ALLOCATION ----------------------------------
 
 // FixedManualAllocatorMalloc allocates a manually managed memory block of
-// `sizeBytes` and `alignment`, returning a `memcore.Pointer` to it.
+// `sizeBytes` and `alignment`, returning a `memcore.MarkRaw` to it.
 // The memory is uninitialized and may contain garbage.
 //
 // Panics if insufficient free space exists.
-func FixedManualAllocatorMalloc(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedManualAllocator](allocator)
+func FixedManualAllocatorMalloc(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
+	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 	alignmentValidate(alignment)
 
 	regionIdx, alignedIdx, spaceBefore, spaceAfter, err := getFreeAlignedIdx(header, sizeBytes, alignment)
@@ -160,60 +154,56 @@ func FixedManualAllocatorMalloc(allocator memcore.Pointer, sizeBytes, alignment 
 	updateFreeListAfterAllocation(header, regionIdx, alignedIdx, sizeBytes, spaceBefore, spaceAfter)
 
 	offset := uintptr(alignedIdx)
-	ptr := memcore.MemcorePointerCreate(header.addressSpace, header.dataRegionOffset+offset, memcore.TypeOf[byte]())
-	memcore.MemcorePointerRegister(ptr)
+	ptr := memcore.MemcoreMarkOffsetFrom(allocator, header.dataRegionOffset+offset)
 	memforgeAllocationAdd(allocator, ptr, sizeBytes)
 	insertAllocationRecord(header, ptr, sizeBytes)
 	return ptr
 }
 
 // FixedManualAllocatorMallocUnsafe is identical to Malloc but skips alignment validation.
-func FixedManualAllocatorMallocUnsafe(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedManualAllocator](allocator)
+func FixedManualAllocatorMallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
+	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 	regionIdx, alignedIdx, spaceBefore, spaceAfter, err := getFreeAlignedIdx(header, sizeBytes, alignment)
 	if err != nil {
 		panic(fmt.Errorf("manual allocator: out of memory: %w", err))
 	}
 	updateFreeListAfterAllocation(header, regionIdx, alignedIdx, sizeBytes, spaceBefore, spaceAfter)
 	offset := uintptr(alignedIdx)
-	ptr := memcore.MemcorePointerCreate(header.addressSpace, header.dataRegionOffset+offset, memcore.TypeOf[byte]())
-	memcore.MemcorePointerRegister(ptr)
+	ptr := memcore.MemcoreMarkOffsetFrom(allocator, header.dataRegionOffset+offset)
 	memforgeAllocationAdd(allocator, ptr, sizeBytes)
 	insertAllocationRecord(header, ptr, sizeBytes)
 	return ptr
 }
 
 // FixedManualAllocatorCalloc allocates and zeroes a block of memory.
-func FixedManualAllocatorCalloc(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
+func FixedManualAllocatorCalloc(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	ptr := FixedManualAllocatorMalloc(allocator, sizeBytes, alignment)
-	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(sizeBytes))
+	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(sizeBytes))
 	return ptr
 }
 
 // FixedManualAllocatorCallocUnsafe allocates and zeroes a block without alignment validation.
-func FixedManualAllocatorCallocUnsafe(allocator memcore.Pointer, sizeBytes, alignment uint64) memcore.Pointer {
+func FixedManualAllocatorCallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	ptr := FixedManualAllocatorMallocUnsafe(allocator, sizeBytes, alignment)
-	memcore.MemoryClearNoHeapPointers(memcore.MemcorePointerDereferenceRaw(ptr), uintptr(sizeBytes))
+	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(sizeBytes))
 	return ptr
 }
 
 // FixedManualAllocatorMallocObject allocates and returns a typed object.
-// It returns a memcore.Pointer to the object, properly aligned.
-func FixedManualAllocatorMallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
+// It returns a memcore.MarkRaw to the object, properly aligned.
+func FixedManualAllocatorMallocObject[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
 	ptr := FixedManualAllocatorMalloc(allocator, size, align)
-	memcore.MemcorePointerUpdateType(ptr, memcore.TypeOf[T]())
 	return ptr
 }
 
 // FixedManualAllocatorCallocObject allocates a zeroed typed object.
-// It returns a memcore.Pointer to the object.
-func FixedManualAllocatorCallocObject[T any](allocator memcore.Pointer) memcore.Pointer {
+// It returns a memcore.MarkRaw to the object.
+func FixedManualAllocatorCallocObject[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
 	ptr := FixedManualAllocatorCalloc(allocator, size, align)
-	memcore.MemcorePointerUpdateType(ptr, memcore.TypeOf[T]())
 	return ptr
 }
 
@@ -222,31 +212,28 @@ func FixedManualAllocatorCallocObject[T any](allocator memcore.Pointer) memcore.
 // FixedManualAllocatorFree releases a previously allocated block and merges
 // it with adjacent free regions if possible. Panics if the pointer was not
 // allocated by this allocator.
-func FixedManualAllocatorFree(allocator memcore.Pointer, target memcore.Pointer) {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedManualAllocator](allocator)
+func FixedManualAllocatorFree(allocator memcore.MarkRaw, target memcore.MarkRaw) {
+	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 	rec, refIdx := fixedManualAllocatorFindRef(header, target)
 	prevIdx, nextIdx := fixedManualAllocatorFindAdjacentRegions(header, rec)
 
 	fixedManualAllocatorMergeOrInsert(header, rec, prevIdx, nextIdx)
-	primitives.FixedOrderedListDeleteUnsafe[allocationRecord](header.ptrRefs, refIdx)
+	memstruct.FixedOrderedListDeleteUnsafe[allocationRecord](header.ptrRefs, refIdx)
 	memforgeAllocationRemove(allocator, target)
-	memcore.MemcorePointerUnregister(target)
 }
 
 // ---------------------------------- RESET ----------------------------------
 
 // FixedManualAllocatorReset clears all allocations, restoring the entire
 // region as a single free block. All previously returned pointers become invalid.
-func FixedManualAllocatorReset(allocator memcore.Pointer) {
-	header := memcore.MemcorePointerDereferenceObjectUnsafe[FixedManualAllocator](allocator)
+func FixedManualAllocatorReset(allocator memcore.MarkRaw) {
+	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 
 	memforgeAllocatorRemoveAll(allocator)
-	memcore.MemcoreAddressSpaceClearPointers(header.addressSpace)
-	memcore.MemcorePointerRegister(allocator)
 
-	primitives.FixedOrderedListClear[freeMemoryRegionBlock](header.freeMemory)
-	primitives.FixedOrderedListClear[allocationRecord](header.ptrRefs)
-	primitives.FixedOrderedListAppendUnsafe(header.freeMemory, freeMemoryRegionBlock{
+	memstruct.FixedOrderedListClear[freeMemoryRegionBlock](header.freeMemory)
+	memstruct.FixedOrderedListClear[allocationRecord](header.ptrRefs)
+	memstruct.FixedOrderedListAppendUnsafe(header.freeMemory, freeMemoryRegionBlock{
 		memStartIdx: 0,
 		sizeBytes:   header.dataBytesCap,
 	})
@@ -257,22 +244,22 @@ func FixedManualAllocatorReset(allocator memcore.Pointer) {
 // ---------------------------------- PRIVATE HELPERS ----------------------------------
 
 // Insert a new record into ptrRefs.
-func insertAllocationRecord(a *FixedManualAllocator, ptr memcore.Pointer, size uint64) {
+func insertAllocationRecord(a *FixedManualAllocator, ptr memcore.MarkRaw, size uint64) {
 	rec := allocationRecord{ptr: ptr, sizeBytes: size}
-	insertIdx := primitives.FixedOrderedListBinarySearchInsertionPoint(a.ptrRefs, func(item allocationRecord) int8 {
+	insertIdx := memstruct.FixedOrderedListBinarySearchInsertionPoint(a.ptrRefs, func(item allocationRecord) int8 {
 		if fixedManualAllocatorGetIdxRelativeToDataRegion(a, item.ptr) < fixedManualAllocatorGetIdxRelativeToDataRegion(a, ptr) {
 			return -1
 		}
 		return 1
 	})
-	if err := primitives.FixedOrderedListInsertAt(a.ptrRefs, insertIdx, rec); err != nil {
+	if err := memstruct.FixedOrderedListInsertAt(a.ptrRefs, insertIdx, rec); err != nil {
 		panic("manual allocator: pointer reference table overflow")
 	}
 }
 
 // Find a record by pointer.
-func fixedManualAllocatorFindRef(a *FixedManualAllocator, target memcore.Pointer) (*allocationRecord, uint64) {
-	refIdx, err := primitives.FixedOrderedListBinarySearch(a.ptrRefs, func(item allocationRecord) int8 {
+func fixedManualAllocatorFindRef(a *FixedManualAllocator, target memcore.MarkRaw) (*allocationRecord, uint64) {
+	refIdx, err := memstruct.FixedOrderedListBinarySearch(a.ptrRefs, func(item allocationRecord) int8 {
 		switch {
 		case fixedManualAllocatorGetIdxRelativeToDataRegion(a, item.ptr) < fixedManualAllocatorGetIdxRelativeToDataRegion(a, target):
 			return -1
@@ -283,14 +270,14 @@ func fixedManualAllocatorFindRef(a *FixedManualAllocator, target memcore.Pointer
 		}
 	})
 	if err != nil {
-		panic(fmt.Errorf("manual allocator: unknown pointer: %s", target))
+		panic(fmt.Errorf("manual allocator: unknown pointer: %v", target))
 	}
-	return primitives.FixedOrderedListItemPtrGetAtUnsafe[allocationRecord](a.ptrRefs, refIdx), refIdx
+	return memstruct.FixedOrderedListItemPtrGetAtUnsafe[allocationRecord](a.ptrRefs, refIdx), refIdx
 }
 
 // Find free regions adjacent to an allocation.
 func fixedManualAllocatorFindAdjacentRegions(a *FixedManualAllocator, ref *allocationRecord) (uint64, uint64) {
-	return primitives.FixedOrderedListBinarySearchInterval(a.freeMemory, func(item freeMemoryRegionBlock) int8 {
+	return memstruct.FixedOrderedListBinarySearchInterval(a.freeMemory, func(item freeMemoryRegionBlock) int8 {
 		if item.memStartIdx < uint64(fixedManualAllocatorGetIdxRelativeToDataRegion(a, ref.ptr)) {
 			return -1
 		}
@@ -300,8 +287,8 @@ func fixedManualAllocatorFindAdjacentRegions(a *FixedManualAllocator, ref *alloc
 
 // Merge or insert free region during deallocation.
 func fixedManualAllocatorMergeOrInsert(a *FixedManualAllocator, ref *allocationRecord, prevIdx, nextIdx uint64) {
-	hasPrev := primitives.FixedOrderedListIsIdxValid[freeMemoryRegionBlock](a.freeMemory, prevIdx)
-	hasNext := primitives.FixedOrderedListIsIdxValid[freeMemoryRegionBlock](a.freeMemory, nextIdx)
+	hasPrev := memstruct.FixedOrderedListIsIdxValid[freeMemoryRegionBlock](a.freeMemory, prevIdx)
+	hasNext := memstruct.FixedOrderedListIsIdxValid[freeMemoryRegionBlock](a.freeMemory, nextIdx)
 	switch {
 	case hasPrev && hasNext:
 		fixedManualAllocatorMergePrevNext(a, ref, prevIdx, nextIdx)
@@ -315,8 +302,8 @@ func fixedManualAllocatorMergeOrInsert(a *FixedManualAllocator, ref *allocationR
 }
 
 func fixedManualAllocatorMergePrevNext(a *FixedManualAllocator, ref *allocationRecord, prevIdx, nextIdx uint64) {
-	prev := primitives.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, prevIdx)
-	next := primitives.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, nextIdx)
+	prev := memstruct.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, prevIdx)
+	next := memstruct.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, nextIdx)
 	canPrev := canMergeRegions(prev.memStartIdx, prev.sizeBytes, uint64(fixedManualAllocatorGetIdxRelativeToDataRegion(a, ref.ptr)))
 	canNext := canMergeRegions(uint64(fixedManualAllocatorGetIdxRelativeToDataRegion(a, ref.ptr)), ref.sizeBytes, next.memStartIdx)
 
@@ -324,7 +311,7 @@ func fixedManualAllocatorMergePrevNext(a *FixedManualAllocator, ref *allocationR
 	case canPrev && canNext:
 		size := prev.sizeBytes + ref.sizeBytes + next.sizeBytes
 		updateFreeRegion(a, prevIdx, prev.memStartIdx, size)
-		primitives.FixedOrderedListDeleteUnsafe[freeMemoryRegionBlock](a.freeMemory, nextIdx)
+		memstruct.FixedOrderedListDeleteUnsafe[freeMemoryRegionBlock](a.freeMemory, nextIdx)
 	case canPrev:
 		fixedManualAllocatorMergePrev(a, ref, prevIdx, nextIdx)
 	case canNext:
@@ -335,7 +322,7 @@ func fixedManualAllocatorMergePrevNext(a *FixedManualAllocator, ref *allocationR
 }
 
 func fixedManualAllocatorMergePrev(a *FixedManualAllocator, ref *allocationRecord, prevIdx, nextIdx uint64) {
-	prev := primitives.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, prevIdx)
+	prev := memstruct.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, prevIdx)
 	if !canMergeRegions(prev.memStartIdx, prev.sizeBytes, uint64(fixedManualAllocatorGetIdxRelativeToDataRegion(a, ref.ptr))) {
 		pushFreePointer(a, ref, nextIdx)
 		return
@@ -344,7 +331,7 @@ func fixedManualAllocatorMergePrev(a *FixedManualAllocator, ref *allocationRecor
 }
 
 func fixedManualAllocatorMergeNext(a *FixedManualAllocator, ref *allocationRecord, nextIdx uint64) {
-	next := primitives.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, nextIdx)
+	next := memstruct.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, nextIdx)
 	if !canMergeRegions(uint64(fixedManualAllocatorGetIdxRelativeToDataRegion(a, ref.ptr)), ref.sizeBytes, next.memStartIdx) {
 		pushFreePointer(a, ref, nextIdx)
 		return
@@ -353,7 +340,7 @@ func fixedManualAllocatorMergeNext(a *FixedManualAllocator, ref *allocationRecor
 }
 
 func updateFreeRegion(a *FixedManualAllocator, mdIdx, memIdx, memSize uint64) {
-	blk := primitives.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, mdIdx)
+	blk := memstruct.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, mdIdx)
 	blk.memStartIdx = memIdx
 	blk.sizeBytes = memSize
 	if mdIdx < a.regionIdxAreaHint {
@@ -363,7 +350,7 @@ func updateFreeRegion(a *FixedManualAllocator, mdIdx, memIdx, memSize uint64) {
 
 func pushFreePointer(a *FixedManualAllocator, ref *allocationRecord, mdIdx uint64) {
 	newBlk := freeMemoryRegionBlock{memStartIdx: uint64(fixedManualAllocatorGetIdxRelativeToDataRegion(a, ref.ptr)), sizeBytes: ref.sizeBytes}
-	if err := primitives.FixedOrderedListInsertAt(a.freeMemory, mdIdx, newBlk); err != nil {
+	if err := memstruct.FixedOrderedListInsertAt(a.freeMemory, mdIdx, newBlk); err != nil {
 		panic("manual allocator: metadata overflow")
 	}
 	if mdIdx < a.regionIdxAreaHint {
@@ -375,7 +362,7 @@ func canMergeRegions(aIdx, aSize, bIdx uint64) bool { return aIdx+aSize == bIdx 
 
 // Search utilities for free regions
 func getFreeAlignedIdx(a *FixedManualAllocator, requestedSize, requestedAlignment uint64) (uint64, uint64, uint64, uint64, error) {
-	regionAmount := primitives.FixedOrderedListLengthGet[freeMemoryRegionBlock](a.freeMemory)
+	regionAmount := memstruct.FixedOrderedListLengthGet[freeMemoryRegionBlock](a.freeMemory)
 	idx, alignedIdx, spaceBefore, spaceAfter, err := freeAlignedIdxLoop(a.regionIdxAreaHint, regionAmount, a, requestedSize, requestedAlignment)
 	if err == nil {
 		return idx, alignedIdx, spaceBefore, spaceAfter, nil
@@ -400,26 +387,26 @@ func updateFreeListAfterAllocation(
 	switch {
 	case spaceBefore == 0 && spaceAfter == 0:
 		// Entire region consumed; remove from free list.
-		primitives.FixedOrderedListDeleteUnsafe[freeMemoryRegionBlock](a.freeMemory, regionIdx)
+		memstruct.FixedOrderedListDeleteUnsafe[freeMemoryRegionBlock](a.freeMemory, regionIdx)
 		if a.regionIdxAreaHint > regionIdx && a.regionIdxAreaHint != 0 {
 			a.regionIdxAreaHint--
 		}
 
 	case spaceBefore == 0 && spaceAfter > 0:
 		// Allocation at the start; shrink region from the left.
-		ptr := primitives.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, regionIdx)
+		ptr := memstruct.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, regionIdx)
 		ptr.memStartIdx = alignedIdx + sizeBytes
 		ptr.sizeBytes = spaceAfter
 
 	case spaceBefore > 0 && spaceAfter == 0:
 		// Allocation at the end; shrink region from the right.
-		ptr := primitives.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, regionIdx)
+		ptr := memstruct.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, regionIdx)
 		ptr.memStartIdx = alignedIdx - spaceBefore
 		ptr.sizeBytes = spaceBefore
 
 	case spaceBefore > 0 && spaceAfter > 0:
 		// Allocation splits the region into two parts.
-		ptr := primitives.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, regionIdx)
+		ptr := memstruct.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, regionIdx)
 		ptr.memStartIdx = alignedIdx - spaceBefore
 		ptr.sizeBytes = spaceBefore
 
@@ -428,7 +415,7 @@ func updateFreeListAfterAllocation(
 			memStartIdx: alignedIdx + sizeBytes,
 			sizeBytes:   spaceAfter,
 		}
-		if err := primitives.FixedOrderedListInsertAt(a.freeMemory, regionIdx+1, newBlock); err != nil {
+		if err := memstruct.FixedOrderedListInsertAt(a.freeMemory, regionIdx+1, newBlock); err != nil {
 			panic(fmt.Errorf("manual allocator: free list insertion failed: %w", err))
 		}
 
@@ -444,7 +431,7 @@ func freeAlignedIdxLoop(
 	requestedSize, requestedAlignment uint64,
 ) (uint64, uint64, uint64, uint64, error) {
 	for i := startIdx; i < lastIdxExclusive; i++ {
-		region := primitives.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, i)
+		region := memstruct.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, i)
 		regionAlignedIdx := alignIdxUp(region.memStartIdx, requestedAlignment)
 
 		if regionAlignedIdx < region.memStartIdx {
@@ -466,11 +453,11 @@ func freeAlignedIdxLoop(
 	}
 
 	// Detailed diagnostic context
-	totalRegions := primitives.FixedOrderedListLengthGet[freeMemoryRegionBlock](a.freeMemory)
+	totalRegions := memstruct.FixedOrderedListLengthGet[freeMemoryRegionBlock](a.freeMemory)
 	activeRegions := 0
 	var largestFree, smallestFree uint64
 	for i := uint64(0); i < totalRegions; i++ {
-		r := primitives.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, i)
+		r := memstruct.FixedOrderedListItemPtrGetAtUnsafe[freeMemoryRegionBlock](a.freeMemory, i)
 		if r.sizeBytes == 0 {
 			continue
 		}
@@ -512,6 +499,6 @@ func freeAlignedIdxLoop(
 }
 
 //go:inline
-func fixedManualAllocatorGetIdxRelativeToDataRegion(a *FixedManualAllocator, pointer memcore.Pointer) uintptr {
-	return memcore.PointerOffset(pointer) - a.dataRegionOffset
+func fixedManualAllocatorGetIdxRelativeToDataRegion(a *FixedManualAllocator, pointer memcore.MarkRaw) uintptr {
+	return memcore.MemcoreMarkSubtractBaseOffset(pointer, a.dataRegionOffset)
 }

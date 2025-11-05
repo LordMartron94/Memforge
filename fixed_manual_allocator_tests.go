@@ -20,7 +20,6 @@ func TestFixedManualAllocator(t *testing.T) {
 
 func testManualCreateAndDestroy(t *testing.T) {
 	a := FixedManualAllocatorCreate(1024)
-	commontesting.Assert(a.IsValid(), "allocator pointer invalid", "allocator created", t)
 
 	mustNotPanic(t, func() {
 		FixedManualAllocatorDestroy(a)
@@ -37,8 +36,8 @@ func testManualMallocAlignmentAndBasicUse(t *testing.T) {
 	p1 := FixedManualAllocatorMalloc(a, 64, 8)
 	p2 := FixedManualAllocatorMalloc(a, 128, 64)
 
-	r1 := memcore.MemcorePointerDereferenceRaw(p1)
-	r2 := memcore.MemcorePointerDereferenceRaw(p2)
+	r1 := memcore.MemcoreMarkDereference(p1)
+	r2 := memcore.MemcoreMarkDereference(p2)
 
 	commontesting.Assert(uintptr(r1)%8 == 0, "p1 not aligned", "p1 aligned", t)
 	commontesting.Assert(uintptr(r2)%64 == 0, "p2 not aligned", "p2 aligned", t)
@@ -49,7 +48,7 @@ func testManualCallocZeroes(t *testing.T) {
 	defer FixedManualAllocatorDestroy(a)
 
 	p := FixedManualAllocatorCalloc(a, 256, 16)
-	r := memcore.MemcorePointerDereferenceRaw(p)
+	r := memcore.MemcoreMarkDereference(p)
 	buf := unsafe.Slice((*byte)(r), 256)
 	commontesting.Assert(allEqual(buf, 0x00), "calloc not zeroed", "calloc ok", t)
 }
@@ -78,7 +77,7 @@ func testManualFreeThenReallocate(t *testing.T) {
 	p1 := FixedManualAllocatorMalloc(a, 256, 16)
 	FixedManualAllocatorFree(a, p1)
 	p2 := FixedManualAllocatorMalloc(a, 256, 16)
-	commontesting.Assert(memcore.PointerOffset(p1) == memcore.PointerOffset(p2),
+	commontesting.Assert(p1 == p2,
 		"freed region not reused", "freed region reused", t)
 }
 
@@ -91,15 +90,14 @@ func testManualResetRestoresFullFreeRegion(t *testing.T) {
 
 	FixedManualAllocatorReset(a)
 
-	p := FixedManualAllocatorMalloc(a, 2048, 8)
-	commontesting.Assert(p.IsValid(), "reset did not restore region", "reset ok", t)
+	_ = FixedManualAllocatorMalloc(a, 2048, 8)
 }
 
 func testManualFragmentationMergePattern(t *testing.T) {
 	a := FixedManualAllocatorCreate(4096)
 	defer FixedManualAllocatorDestroy(a)
 
-	ptrs := make([]memcore.Pointer, 4)
+	ptrs := make([]memcore.MarkRaw, 4)
 	for i := 0; i < 4; i++ {
 		ptrs[i] = FixedManualAllocatorMalloc(a, 1024, 8)
 	}
@@ -110,8 +108,7 @@ func testManualFragmentationMergePattern(t *testing.T) {
 	FixedManualAllocatorFree(a, ptrs[1])
 	FixedManualAllocatorFree(a, ptrs[3])
 
-	p := FixedManualAllocatorMalloc(a, 4096, 8)
-	commontesting.Assert(p.IsValid(), "fragmentation merge failed", "merge ok", t)
+	_ = FixedManualAllocatorMalloc(a, 4096, 8)
 
 }
 
