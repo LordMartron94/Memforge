@@ -28,7 +28,7 @@ type DynamicLinearAllocator struct {
 //
 // It allocates both the header and initial arena contiguously and registers a namespace
 // for all pointers allocated within. The returned memcore.MarkRaw refers to the allocator header.
-func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategy memcore.FunctionID) memcore.MarkRaw {
+func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategyID memcore.FunctionID) memcore.MarkRaw {
 	headerSize := memcore.SizeOf[DynamicLinearAllocator]()
 	headerAlignedSize := alignIdxUp(headerSize, uint64(allocatorDataAddrAlignment))
 
@@ -52,7 +52,46 @@ func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategy me
 		allocatorTotalSize: totalSize,
 		dataCapBytes:       initialCapacityBytes,
 		dataByteIdx:        0,
-		growthStrategyID:   growthStrategy,
+		growthStrategyID:   growthStrategyID,
+	}
+
+	memforgeAllocatorRegister(allocatorPtr, "Dynamic Linear (Manual)")
+
+	return allocatorPtr
+}
+
+// DynamicLinearAllocatorCreateFunction creates a new dynamic allocator in its own mmap region.
+// This variant automatically registers the growth strategy.
+//
+// It allocates both the header and initial arena contiguously and registers a namespace
+// for all pointers allocated within. The returned memcore.MarkRaw refers to the allocator header.
+func DynamicLinearAllocatorCreateFunction(initialCapacityBytes uint64, growthStrategy GrowthStrategy) memcore.MarkRaw {
+	headerSize := memcore.SizeOf[DynamicLinearAllocator]()
+	headerAlignedSize := alignIdxUp(headerSize, uint64(allocatorDataAddrAlignment))
+
+	totalSize := initialCapacityBytes + headerAlignedSize
+
+	mmap, err := memcore.MemmapRequest(int(totalSize), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
+	if err != nil {
+		panic(fmt.Errorf("failed to create dynamic allocator: %w", err))
+	}
+
+	allocatorAddr := uintptr(unsafe.Pointer(&mmap[0]))
+	regionID := memcore.MemcoreRegionRegister(allocatorAddr, totalSize)
+
+	allocatorPtr := memcore.MemcoreMarkCreate(regionID, 0)
+
+	growthStrategyID := memcore.MemcoreFunctionRegisterTyped(growthStrategy)
+
+	header := memcore.MemcoreMarkDereferenceObject[DynamicLinearAllocator](allocatorPtr)
+	*header = DynamicLinearAllocator{
+		allocatorAddr:      allocatorAddr,
+		dataBaseOffset:     uintptr(headerAlignedSize),
+		regionID:           regionID,
+		allocatorTotalSize: totalSize,
+		dataCapBytes:       initialCapacityBytes,
+		dataByteIdx:        0,
+		growthStrategyID:   growthStrategyID,
 	}
 
 	memforgeAllocatorRegister(allocatorPtr, "Dynamic Linear (Manual)")
