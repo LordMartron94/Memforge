@@ -55,7 +55,7 @@ func SlabAllocatorCreate[T any](capacity uint64) memcore.MarkRaw {
 	stackBytes := memstruct.StackRequiredBytesGet[uint64](capacity)
 	stackAlign := memstruct.StackRequiredAlignmentGet[uint64]()
 
-	metaAlloc := FixedLinearAllocatorCreate(int(stackBytes))
+	metaAlloc := FixedLinearAllocatorCreate(stackBytes)
 	header.metaAllocator = metaAlloc
 
 	stackPtr := FixedLinearAllocatorMalloc(metaAlloc, stackBytes, stackAlign)

@@ -31,11 +31,11 @@ type FixedLinearAllocator struct {
 //
 // The allocator automatically registers a namespace for all future allocations.
 // On success, it returns a `memcore.MarkRaw` to the allocator header itself.
-func FixedLinearAllocatorCreate(sizeBytes int) memcore.MarkRaw {
+func FixedLinearAllocatorCreate(sizeBytes uint64) memcore.MarkRaw {
 	headerSize := memcore.SizeOf[FixedLinearAllocator]()
 	headerAlignedSize := alignIdxUp(uint64(headerSize), uint64(allocatorDataAddrAlignment))
 
-	totalSize := headerAlignedSize + uint64(sizeBytes)
+	totalSize := headerAlignedSize + sizeBytes
 
 	mmap, err := memcore.MemmapRequest(int(totalSize), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
 	if err != nil {
@@ -56,7 +56,7 @@ func FixedLinearAllocatorCreate(sizeBytes int) memcore.MarkRaw {
 		dataBaseOffset:     uintptr(headerAlignedSize),
 		regionID:           regionID,
 		dataByteIdx:        0,
-		dataCapBytes:       uint64(sizeBytes),
+		dataCapBytes:       sizeBytes,
 	}
 
 	memforgeAllocatorRegister(allocatorPtr, "Fixed Linear (Manual)")
