@@ -199,6 +199,19 @@ func DynamicLinearAllocatorReset(allocator memcore.MarkRaw) {
 
 // -------------------------- PRIVATE HELPERS --------------------------
 
+type GrowthStrategyViolation struct {
+	PrevCapacity uint64
+	Required     uint64
+	Returned     uint64
+}
+
+func (e GrowthStrategyViolation) Error() string {
+	return fmt.Sprintf(
+		"growth strategy violation: returned %d < required %d (previous capacity %d)",
+		e.Returned, e.Required, e.PrevCapacity,
+	)
+}
+
 //go:inline
 func dynamicLinearAllocatorGrow(header *DynamicLinearAllocator, neededCapacityBytes uint64) *DynamicLinearAllocator {
 	prev := *header
@@ -206,7 +219,11 @@ func dynamicLinearAllocatorGrow(header *DynamicLinearAllocator, neededCapacityBy
 	strategy := memcore.MemcoreFunctionRetrieveTyped[GrowthStrategy](prev.growthStrategyID)
 	newSize := strategy(prev.dataCapBytes, neededCapacityBytes)
 	if newSize < neededCapacityBytes {
-		panic("growth strategy returned invalid new size")
+		panic(GrowthStrategyViolation{
+			PrevCapacity: prev.dataCapBytes,
+			Required:     neededCapacityBytes,
+			Returned:     newSize,
+		})
 	}
 
 	oldTotal := prev.allocatorTotalSize

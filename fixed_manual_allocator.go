@@ -82,7 +82,7 @@ func FixedManualAllocatorCreate(sizeBytes uint64) memcore.MarkRaw {
 	ptrRefBytes := alignIdxUp(memstruct.FixedOrderedListRequiredBytes[allocationRecord](maxAllocs), memstruct.FixedOrderedListRequiredAlignment[allocationRecord]())
 	freeListBytes := alignIdxUp(memstruct.FixedOrderedListRequiredBytes[freeMemoryRegionBlock](maxAllocs), memstruct.FixedOrderedListRequiredAlignment[freeMemoryRegionBlock]())
 	metaBytes := ptrRefBytes + freeListBytes
-	metaAlloc := FixedLinearAllocatorCreate(int(metaBytes))
+	metaAlloc := FixedLinearAllocatorCreate(metaBytes)
 
 	// Allocate list memory
 	ptrRefsPtr := FixedLinearAllocatorMalloc(metaAlloc, ptrRefBytes, memcore.AlignOf[memstruct.FixedOrderedList[allocationRecord]]())
