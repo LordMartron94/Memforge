@@ -39,18 +39,7 @@ func GetFunctionName(i interface{}) string {
 
 const maxGrowthMem = 8 * 1024 * 1024
 
-func growthStrategy2x(currentCap, neededCap uint64) uint64 {
-	newCap := currentCap * 2
-	if newCap < neededCap {
-		newCap = neededCap
-	}
-	if newCap > maxGrowthMem {
-		panic(fmt.Sprintf("benchmark setup went wrong, requested=%v/available=%v", newCap, maxGrowthMem))
-	}
-	return newCap
-}
-
-var growthStrategyID memcore.FunctionID = memcore.MemcoreFunctionRegisterTyped[GrowthStrategy](growthStrategy2x)
+var growthStrategyID memcore.FunctionID = DynamicLinearAllocatorGrowthTemplateDoubleOrNeededWithMaxPanicID(maxGrowthMem)
 
 // -----------------------------------------------------------------------------
 // Allocator Comparison Suite

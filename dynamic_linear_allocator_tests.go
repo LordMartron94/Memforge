@@ -133,11 +133,4 @@ func testDynamicGrowth(t *testing.T) {
 	commontesting.Assert(r1 != nil && r2 != nil, "growth invalid pointers", "growth ok", t)
 }
 
-func doublingGrowth(cur, need uint64) uint64 {
-	for cur < need {
-		cur *= 2
-	}
-	return cur
-}
-
-var growthStrategyIDTests memcore.FunctionID = memcore.MemcoreFunctionRegisterTyped[GrowthStrategy](doublingGrowth)
+var growthStrategyIDTests memcore.FunctionID = memcore.MemcoreFunctionRegisterTyped[GrowthStrategy](DynamicLinearAllocatorGrowthDoubleOrNeeded)
