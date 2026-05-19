@@ -39,7 +39,23 @@ const (
 )
 
 var debugStats = make(map[memcore.MarkRaw]*allocatorStats)
+var timelineEvents []timelineEvent
+var timelineSeq uint64
 var internalPrefixes = []string{"runtime.", "reflect.", "memcore.", "testing.", "memforge.test"}
+
+type timelineEvent struct {
+	seq               uint64
+	timestamp         time.Time
+	kind              MemforgeTimelineEventKind
+	allocatorAddress  uintptr
+	allocatorName     string
+	stack             string
+	allocationAddress uintptr
+	sizeBytes         uint64
+	originalSeq       uint64
+	originalCreatedAt time.Time
+	freedAllocations  []MemforgeTimelineFreedAllocation
+}
 
 type allocatorStats struct {
 	allocatorName                                        string
@@ -52,6 +68,7 @@ type allocatorStats struct {
 }
 
 type allocation struct {
+	seq       uint64
 	ptr       memcore.MarkRaw
 	sizeBytes uint64
 	timestamp time.Time
@@ -89,6 +106,37 @@ func isInternalFrame(fn string) bool {
 	return false
 }
 
+func appendTimelineEvent(evt timelineEvent) {
+	timelineSeq++
+	evt.seq = timelineSeq
+	evt.timestamp = time.Now()
+	timelineEvents = append(timelineEvents, evt)
+}
+
+func timelineAllocatorAddress(allocatorPtr memcore.MarkRaw) uintptr {
+	return uintptr(memcore.MemcoreMarkDereferenceUnsafe(allocatorPtr))
+}
+
+func timelineAllocationAddress(allocationPtr memcore.MarkRaw) uintptr {
+	return uintptr(memcore.MemcoreMarkDereferenceUnsafe(allocationPtr))
+}
+
+func timelineFreedAllocationsFromLive(live []allocation) []MemforgeTimelineFreedAllocation {
+	if len(live) == 0 {
+		return nil
+	}
+	freed := make([]MemforgeTimelineFreedAllocation, len(live))
+	for i, entry := range live {
+		freed[i] = MemforgeTimelineFreedAllocation{
+			AllocationAddress: uintptr(memcore.MemcoreMarkDereferenceUnsafe(entry.ptr)),
+			SizeBytes:         entry.sizeBytes,
+			OriginalSeq:       entry.seq,
+			OriginalCreatedAt: entry.timestamp,
+		}
+	}
+	return freed
+}
+
 // Register a new allocator and record its creation site.
 func memforgeAllocatorRegister(allocatorPtr memcore.MarkRaw, name string) {
 	debugStats[allocatorPtr] = &allocatorStats{
@@ -96,6 +144,12 @@ func memforgeAllocatorRegister(allocatorPtr memcore.MarkRaw, name string) {
 		createdAt:     time.Now(),
 		creator:       memforgeCaptureCallStack(2),
 	}
+	appendTimelineEvent(timelineEvent{
+		kind:             MemforgeTimelineEventAllocatorRegister,
+		allocatorAddress: timelineAllocatorAddress(allocatorPtr),
+		allocatorName:    name,
+		stack:            memforgeCaptureCallStack(2),
+	})
 }
 
 // Record a new allocation in the debug tracker.
@@ -105,11 +159,12 @@ func memforgeAllocationAdd(allocatorPtr, allocationPtr memcore.MarkRaw, sizeByte
 		return
 	}
 
+	creator := memforgeCaptureCallStack(2)
 	entry := allocation{
 		ptr:       allocationPtr,
 		sizeBytes: sizeBytes,
 		timestamp: time.Now(),
-		creator:   memforgeCaptureCallStack(2),
+		creator:   creator,
 	}
 	stats.allAllocations = append(stats.allAllocations, entry)
 	stats.currentlyLiveAllocations = append(stats.currentlyLiveAllocations, entry)
@@ -122,6 +177,18 @@ func memforgeAllocationAdd(allocatorPtr, allocationPtr memcore.MarkRaw, sizeByte
 	if uint64(len(stats.currentlyLiveAllocations)) > stats.peakLiveAllocs {
 		stats.peakLiveAllocs = uint64(len(stats.currentlyLiveAllocations))
 	}
+
+	appendTimelineEvent(timelineEvent{
+		kind:              MemforgeTimelineEventAllocation,
+		allocatorAddress:  timelineAllocatorAddress(allocatorPtr),
+		allocatorName:     stats.allocatorName,
+		stack:             creator,
+		allocationAddress: timelineAllocationAddress(allocationPtr),
+		sizeBytes:         sizeBytes,
+	})
+	entry.seq = timelineSeq
+	stats.allAllocations[len(stats.allAllocations)-1] = entry
+	stats.currentlyLiveAllocations[len(stats.currentlyLiveAllocations)-1] = entry
 }
 
 // Remove a single freed allocation.
@@ -131,19 +198,60 @@ func memforgeAllocationRemove(allocatorPtr, allocationPtr memcore.MarkRaw) {
 		return
 	}
 	ptr2 := allocationPtr
+	var removed allocation
+	found := false
 	stats.currentlyLiveAllocations = slices.DeleteFunc(stats.currentlyLiveAllocations, func(a allocation) bool {
 		if a.ptr == ptr2 {
+			removed = a
+			found = true
 			stats.liveBytes -= a.sizeBytes
 			return true
 		}
 		return false
 	})
+	if !found {
+		return
+	}
+
+	appendTimelineEvent(timelineEvent{
+		kind:              MemforgeTimelineEventFreeManual,
+		allocatorAddress:  timelineAllocatorAddress(allocatorPtr),
+		allocatorName:     stats.allocatorName,
+		stack:             memforgeCaptureCallStack(2),
+		allocationAddress: timelineAllocationAddress(allocationPtr),
+		sizeBytes:         removed.sizeBytes,
+		originalSeq:       removed.seq,
+		originalCreatedAt: removed.timestamp,
+	})
 }
 
 // Marks an allocator as destroyed.
 func memforgeAllocatorDestroy(allocatorPtr memcore.MarkRaw) {
-	memforgeAllocatorRemoveAll(allocatorPtr)
 	stats := debugStats[allocatorPtr]
+	if stats == nil {
+		return
+	}
+
+	live := slices.Clone(stats.currentlyLiveAllocations)
+	if len(live) > 0 {
+		appendTimelineEvent(timelineEvent{
+			kind:             MemforgeTimelineEventFreeRegionalDestroy,
+			allocatorAddress: timelineAllocatorAddress(allocatorPtr),
+			allocatorName:    stats.allocatorName,
+			stack:            memforgeCaptureCallStack(2),
+			freedAllocations: timelineFreedAllocationsFromLive(live),
+		})
+	}
+
+	appendTimelineEvent(timelineEvent{
+		kind:             MemforgeTimelineEventAllocatorDestroy,
+		allocatorAddress: timelineAllocatorAddress(allocatorPtr),
+		allocatorName:    stats.allocatorName,
+		stack:            memforgeCaptureCallStack(2),
+	})
+
+	stats.currentlyLiveAllocations = nil
+	stats.liveBytes = 0
 	stats.destroyed = true
 }
 
@@ -153,6 +261,18 @@ func memforgeAllocatorRemoveAll(allocatorPtr memcore.MarkRaw) {
 	if stats == nil {
 		return
 	}
+
+	live := slices.Clone(stats.currentlyLiveAllocations)
+	if len(live) > 0 {
+		appendTimelineEvent(timelineEvent{
+			kind:             MemforgeTimelineEventFreeRegionalReset,
+			allocatorAddress: timelineAllocatorAddress(allocatorPtr),
+			allocatorName:    stats.allocatorName,
+			stack:            memforgeCaptureCallStack(2),
+			freedAllocations: timelineFreedAllocationsFromLive(live),
+		})
+	}
+
 	stats.currentlyLiveAllocations = nil
 	stats.liveBytes = 0
 }
@@ -661,4 +781,114 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+/*
+MemforgeMemoryTimelineSnapshotGet returns a copy of all recorded timeline events.
+*/
+func MemforgeMemoryTimelineSnapshotGet() MemforgeMemoryTimelineSnapshot {
+	events := make([]MemforgeTimelineEvent, len(timelineEvents))
+	for i, evt := range timelineEvents {
+		events[i] = timelineEventToPublic(evt)
+	}
+	return MemforgeMemoryTimelineSnapshot{
+		Available:  true,
+		CapturedAt: time.Now(),
+		EventCount: len(events),
+		Events:     events,
+	}
+}
+
+func timelineEventToPublic(evt timelineEvent) MemforgeTimelineEvent {
+	out := MemforgeTimelineEvent{
+		Seq:               evt.seq,
+		Timestamp:         evt.timestamp,
+		Kind:              evt.kind,
+		AllocatorAddress:  evt.allocatorAddress,
+		AllocatorName:     evt.allocatorName,
+		Stack:             evt.stack,
+		AllocationAddress: evt.allocationAddress,
+		SizeBytes:         evt.sizeBytes,
+		OriginalSeq:       evt.originalSeq,
+		OriginalCreatedAt: evt.originalCreatedAt,
+	}
+	if len(evt.freedAllocations) > 0 {
+		out.FreedAllocations = slices.Clone(evt.freedAllocations)
+	}
+	return out
+}
+
+/*
+MemforgeMemoryTimelineDebug prints a terminal-formatted allocation timeline.
+*/
+func MemforgeMemoryTimelineDebug(params MemforgeMemoryTimelineRenderParams) {
+	snapshot := MemforgeMemoryTimelineSnapshotGet()
+	if snapshot.EventCount == 0 {
+		fmt.Printf("\n%s=== MEMFORGE ALLOCATION TIMELINE ===%s\n%s(no events recorded)%s\n\n",
+			colorBoldCyan, colorReset, colorYellow, colorReset)
+		return
+	}
+
+	limit := snapshot.EventCount
+	if params.MaxEvents > 0 && params.MaxEvents < limit {
+		limit = params.MaxEvents
+	}
+
+	fmt.Printf("\n%s=== MEMFORGE ALLOCATION TIMELINE ===%s\n", colorBoldCyan, colorReset)
+	fmt.Printf("%sEvents:%s %d", colorWhite, colorReset, snapshot.EventCount)
+	if limit < snapshot.EventCount {
+		fmt.Printf(" %s(showing first %d)%s", colorGray, limit, colorReset)
+	}
+	fmt.Printf("\n\n")
+
+	for i := 0; i < limit; i++ {
+		writeTimelineEventLine(&snapshot.Events[i], params.ExpandRegionalFreed)
+	}
+	if limit < snapshot.EventCount {
+		fmt.Printf("%s... %d more events not shown%s\n", colorGray, snapshot.EventCount-limit, colorReset)
+	}
+	fmt.Println()
+}
+
+func writeTimelineEventLine(evt *MemforgeTimelineEvent, expandRegional bool) {
+	fmt.Printf("%s#%-6d%s %s%s%s %s%s%s\n",
+		colorGray, evt.Seq, colorReset,
+		colorCyan, evt.Timestamp.Format("15:04:05.000"), colorReset,
+		colorYellow, evt.Kind, colorReset)
+	fmt.Printf("  %sAllocator:%s %s (%s)\n",
+		colorWhite, colorReset, evt.AllocatorName, formatTimelineAddress(evt.AllocatorAddress))
+
+	switch evt.Kind {
+	case MemforgeTimelineEventAllocation, MemforgeTimelineEventFreeManual:
+		fmt.Printf("  %sAddress:%s %s  %sSize:%s %s\n",
+			colorWhite, colorReset, formatTimelineAddress(evt.AllocationAddress),
+			colorWhite, colorReset, humanBytes(float64(evt.SizeBytes)))
+		if evt.Kind == MemforgeTimelineEventFreeManual {
+			fmt.Printf("  %sOrig:#%d%s at %s\n",
+				colorGray, evt.OriginalSeq, colorReset, evt.OriginalCreatedAt.Format("15:04:05.000"))
+		}
+	case MemforgeTimelineEventFreeRegionalReset, MemforgeTimelineEventFreeRegionalDestroy:
+		fmt.Printf("  %sFreed:%s %d allocation(s)\n", colorWhite, colorReset, len(evt.FreedAllocations))
+		if expandRegional {
+			for _, freed := range evt.FreedAllocations {
+				fmt.Printf("    - %s %s (orig #%d at %s)\n",
+					formatTimelineAddress(freed.AllocationAddress),
+					humanBytes(float64(freed.SizeBytes)),
+					freed.OriginalSeq,
+					freed.OriginalCreatedAt.Format("15:04:05.000"))
+			}
+		}
+	}
+
+	if strings.TrimSpace(evt.Stack) != "" {
+		fmt.Printf("  %s%s%s\n", colorGray, evt.Stack, colorReset)
+	}
+	fmt.Println()
+}
+
+func formatTimelineAddress(address uintptr) string {
+	if address == 0 {
+		return "<invalid>"
+	}
+	return fmt.Sprintf("0x%016x", address)
 }
