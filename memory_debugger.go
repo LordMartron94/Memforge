@@ -216,7 +216,7 @@ func buildAllocatorSnapshot(ptr memcore.MarkRaw, stats *allocatorStats) Memforge
 	status, _, _ := allocatorStatusInfo(stats)
 	snapshot := MemforgeAllocatorSnapshot{
 		Name:             stats.allocatorName,
-		Address:          uintptr(memcore.MemcoreMarkDereference(ptr)),
+		Address:          memforgeAddressFromMark(ptr),
 		Destroyed:        stats.destroyed,
 		CreatedAt:        stats.createdAt,
 		Creator:          stats.creator,
@@ -252,13 +252,20 @@ func buildLiveAllocationSnapshots(allocs []allocation) []MemforgeAllocationSnaps
 	for i := 0; i < limit; i++ {
 		entry := live[i]
 		details = append(details, MemforgeAllocationSnapshot{
-			Address:   uintptr(memcore.MemcoreMarkDereference(entry.ptr)),
+			Address:   memforgeAddressFromMark(entry.ptr),
 			SizeBytes: entry.sizeBytes,
 			CreatedAt: entry.timestamp,
 			Creator:   entry.creator,
 		})
 	}
 	return details
+}
+
+func memforgeAddressFromMark(mark memcore.MarkRaw) uintptr {
+	if !memcore.MemcoreMarkIsValid(mark) {
+		return 0
+	}
+	return uintptr(memcore.MemcoreMarkDereference(mark))
 }
 
 // MemforgeMemoryDebug prints a focused summary of allocator usage and leaks.
