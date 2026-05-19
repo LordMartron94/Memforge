@@ -25,6 +25,9 @@ type MemforgeAllocatorSnapshot struct {
 	LiveAllocations       int
 	TotalBytes            uint64
 	LiveBytes             uint64
+	PeakLiveBytes         uint64
+	PeakLiveAllocations   int
+	LastAllocationAt      time.Time
 	Status                string
 	LiveAllocationDetails []MemforgeAllocationSnapshot
 }
