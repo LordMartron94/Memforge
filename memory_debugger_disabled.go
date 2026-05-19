@@ -4,6 +4,15 @@ package memforge
 
 import "memcore"
 
+/*
+MemforgeMemorySnapshotGet returns an unavailable snapshot when memforge_debug is disabled.
+*/
+func MemforgeMemorySnapshotGet() MemforgeMemorySnapshot {
+	return MemforgeMemorySnapshot{
+		Available: false,
+	}
+}
+
 // MemforgeMemoryDebug is a no-op when memforge_debug is disabled.
 func MemforgeMemoryDebug() {}
 

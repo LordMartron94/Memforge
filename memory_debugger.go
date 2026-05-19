@@ -157,6 +157,110 @@ func memforgeAllocatorRemoveAll(allocatorPtr memcore.MarkRaw) {
 	stats.liveBytes = 0
 }
 
+/*
+MemforgeMemorySnapshotGet returns structured allocator and leak telemetry without printing.
+*/
+func MemforgeMemorySnapshotGet() MemforgeMemorySnapshot {
+	snapshot := MemforgeMemorySnapshot{
+		Available:  true,
+		CapturedAt: time.Now(),
+	}
+
+	if len(debugStats) == 0 {
+		return snapshot
+	}
+
+	typeGroups := groupAllocatorsByType(debugStats)
+	typeNames := sortedTypeNames(typeGroups)
+	snapshot.AllocatorTypeCount = len(typeNames)
+
+	allocators := make([]MemforgeAllocatorSnapshot, 0, len(debugStats))
+	for ptr, stats := range debugStats {
+		allocators = append(allocators, buildAllocatorSnapshot(ptr, stats))
+	}
+	slices.SortFunc(allocators, func(a, b MemforgeAllocatorSnapshot) int {
+		switch {
+		case a.Name < b.Name:
+			return -1
+		case a.Name > b.Name:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	snapshot.Allocators = allocators
+	snapshot.AllocatorCount = len(allocators)
+
+	for _, allocator := range allocators {
+		snapshot.TotalAllocationCount += allocator.TotalAllocations
+		snapshot.LiveAllocationCount += allocator.LiveAllocations
+		snapshot.TotalBytes += allocator.TotalBytes
+		snapshot.LiveBytes += allocator.LiveBytes
+
+		if allocator.Destroyed {
+			snapshot.DestroyedAllocatorCount++
+		} else {
+			snapshot.ActiveAllocatorCount++
+		}
+		if allocator.LiveAllocations > 0 {
+			snapshot.AllocatorsWithLiveAllocs++
+		}
+	}
+
+	snapshot.LeakDetected = snapshot.LiveAllocationCount > 0
+	return snapshot
+}
+
+func buildAllocatorSnapshot(ptr memcore.MarkRaw, stats *allocatorStats) MemforgeAllocatorSnapshot {
+	status, _, _ := allocatorStatusInfo(stats)
+	snapshot := MemforgeAllocatorSnapshot{
+		Name:             stats.allocatorName,
+		Address:          uintptr(memcore.MemcoreMarkDereference(ptr)),
+		Destroyed:        stats.destroyed,
+		CreatedAt:        stats.createdAt,
+		Creator:          stats.creator,
+		TotalAllocations: len(stats.allAllocations),
+		LiveAllocations:  len(stats.currentlyLiveAllocations),
+		TotalBytes:       stats.totalBytes,
+		LiveBytes:        stats.liveBytes,
+		Status:           status,
+	}
+
+	if snapshot.LiveAllocations > 0 {
+		snapshot.LiveAllocationDetails = buildLiveAllocationSnapshots(stats.currentlyLiveAllocations)
+	}
+
+	return snapshot
+}
+
+func buildLiveAllocationSnapshots(allocs []allocation) []MemforgeAllocationSnapshot {
+	live := slices.Clone(allocs)
+	slices.SortFunc(live, func(a, b allocation) int {
+		switch {
+		case a.sizeBytes > b.sizeBytes:
+			return -1
+		case a.sizeBytes < b.sizeBytes:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	limit := min(3, len(live))
+	details := make([]MemforgeAllocationSnapshot, 0, limit)
+	for i := 0; i < limit; i++ {
+		entry := live[i]
+		details = append(details, MemforgeAllocationSnapshot{
+			Address:   uintptr(memcore.MemcoreMarkDereference(entry.ptr)),
+			SizeBytes: entry.sizeBytes,
+			CreatedAt: entry.timestamp,
+			Creator:   entry.creator,
+		})
+	}
+	return details
+}
+
 // MemforgeMemoryDebug prints a focused summary of allocator usage and leaks.
 func MemforgeMemoryDebug() {
 	if len(debugStats) == 0 {
