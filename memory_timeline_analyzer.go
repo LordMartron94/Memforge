@@ -380,14 +380,60 @@ func compareArenaSummaries(a, b MemforgeArenaSummary) int {
 		}
 		return 1
 	}
+	stackCmp := compareStringSlicesLex(a.FilteredCreatorStack, b.FilteredCreatorStack)
 	switch {
 	case a.LiveBytes > b.LiveBytes:
 		return -1
 	case a.LiveBytes < b.LiveBytes:
 		return 1
+	case a.LiveAllocations > b.LiveAllocations:
+		return -1
+	case a.LiveAllocations < b.LiveAllocations:
+		return 1
 	case a.Name < b.Name:
 		return -1
 	case a.Name > b.Name:
+		return 1
+	case stackCmp < 0:
+		return -1
+	case stackCmp > 0:
+		return 1
+	case a.CreatedAt.Before(b.CreatedAt):
+		return -1
+	case a.CreatedAt.After(b.CreatedAt):
+		return 1
+	case a.LastAllocationAt.Before(b.LastAllocationAt):
+		return -1
+	case a.LastAllocationAt.After(b.LastAllocationAt):
+		return 1
+	case a.Address < b.Address:
+		return -1
+	case a.Address > b.Address:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func compareStringSlicesLex(a, b []string) int {
+	minLen := len(a)
+	if len(b) < minLen {
+		minLen = len(b)
+	}
+
+	for i := 0; i < minLen; i++ {
+		switch {
+		case a[i] < b[i]:
+			return -1
+		case a[i] > b[i]:
+			return 1
+		}
+	}
+
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
 		return 1
 	default:
 		return 0

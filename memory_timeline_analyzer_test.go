@@ -123,6 +123,62 @@ func TestMemforgeMemoryTimelineAnalyzeArenaGrowSegments(t *testing.T) {
 	}
 }
 
+func TestMemforgeMemoryTimelineAnalyzeDeterministicArenaOrder(t *testing.T) {
+	now := time.Now()
+	snapshot := MemforgeMemoryTimelineSnapshot{
+		Available:  true,
+		CapturedAt: now.Add(2 * time.Second),
+		Events: []MemforgeTimelineEvent{
+			{
+				Seq:               1,
+				Timestamp:         now,
+				Kind:              MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress:  0x3000,
+				AllocatorName:     "Fixed Linear (Manual)",
+				Stack:             "app.Main → rendering.WindowManagerCreate",
+				ArenaDataCapBytes: 1024,
+				ArenaTotalBytes:   1152,
+			},
+			{
+				Seq:               2,
+				Timestamp:         now.Add(2 * time.Millisecond),
+				Kind:              MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress:  0x1000,
+				AllocatorName:     "Fixed Linear (Manual)",
+				Stack:             "app.Main → rendering.GraphicalRendererCreate",
+				ArenaDataCapBytes: 1024,
+				ArenaTotalBytes:   1152,
+			},
+			{
+				Seq:               3,
+				Timestamp:         now.Add(3 * time.Millisecond),
+				Kind:              MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress:  0x2000,
+				AllocatorName:     "Fixed Linear (Manual)",
+				Stack:             "app.Main → rendering.GraphicalRendererCreate",
+				ArenaDataCapBytes: 1024,
+				ArenaTotalBytes:   1152,
+			},
+		},
+	}
+
+	analysis := MemforgeMemoryTimelineAnalyze(snapshot, MemforgeStackFilter{})
+	if len(analysis.Arenas) != 3 {
+		t.Fatalf("expected 3 arenas, got %d", len(analysis.Arenas))
+	}
+
+	// The semantic order should prioritize creator stack, then creation time, then address.
+	if analysis.Arenas[0].Address != 0x1000 {
+		t.Fatalf("unexpected arena[0] order: %#x", analysis.Arenas[0].Address)
+	}
+	if analysis.Arenas[1].Address != 0x2000 {
+		t.Fatalf("unexpected arena[1] order: %#x", analysis.Arenas[1].Address)
+	}
+	if analysis.Arenas[2].Address != 0x3000 {
+		t.Fatalf("unexpected arena[2] order: %#x", analysis.Arenas[2].Address)
+	}
+}
+
 func TestMemforgeMemoryTimelineJSONLRoundTrip(t *testing.T) {
 	now := time.Now()
 	snapshot := MemforgeMemoryTimelineSnapshot{
