@@ -185,13 +185,15 @@ With `FixedManualAllocator`, double frees or freeing unknown pointers cause unde
 
 ## Memory Debugger
 
-`memforge` includes a memory debugger that can track allocations and detect leaks:
+Build with `-tags memforge_debug` to enable allocation tracking, leak detection, and timeline export.
 
 ```go
 defer memforge.MemforgeMemoryDebug()
 // ... use allocators ...
-// Debug info printed on defer
+// Prints arena summary, leak groups, and verdict from structured timeline analysis
 ```
+
+`MemforgeMemorySnapshotGet()` and `MemforgeMemoryTimelineAnalyze()` expose the same telemetry for tooling (for example SHIELD). Arena data capacity is recorded at registration; dynamic linear allocators also emit `allocator_grow` events so the analyzer can build time-segmented capacity history. Use `MemforgeMemoryDebugWithParams` to apply stack filters or include a granular event listing (`Timeline.MaxEvents > 0`).
 
 ## Integration
 

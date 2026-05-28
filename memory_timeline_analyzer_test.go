@@ -35,12 +35,14 @@ func TestMemforgeMemoryTimelineAnalyzeReplay(t *testing.T) {
 		CapturedAt: now.Add(2 * time.Second),
 		Events: []MemforgeTimelineEvent{
 			{
-				Seq:              1,
-				Timestamp:        now,
-				Kind:             MemforgeTimelineEventAllocatorRegister,
-				AllocatorAddress: addr,
-				AllocatorName:    "arena-a",
-				Stack:            "runner.Run → app.CreateArena",
+				Seq:               1,
+				Timestamp:         now,
+				Kind:              MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress:  addr,
+				AllocatorName:     "arena-a",
+				Stack:             "runner.Run → app.CreateArena",
+				ArenaDataCapBytes: 512,
+				ArenaTotalBytes:   640,
 			},
 			{
 				Seq:               2,
@@ -67,6 +69,57 @@ func TestMemforgeMemoryTimelineAnalyzeReplay(t *testing.T) {
 	}
 	if len(analysis.Arenas[0].FilteredCreatorStack) != 1 || analysis.Arenas[0].FilteredCreatorStack[0] != "app.CreateArena" {
 		t.Fatalf("unexpected filtered creator stack: %#v", analysis.Arenas[0].FilteredCreatorStack)
+	}
+	if analysis.Arenas[0].CurrentArenaDataCapBytes != 512 || analysis.Arenas[0].CurrentArenaTotalBytes != 640 {
+		t.Fatalf("unexpected arena capacity: %+v", analysis.Arenas[0])
+	}
+}
+
+func TestMemforgeMemoryTimelineAnalyzeArenaGrowSegments(t *testing.T) {
+	now := time.Now()
+	addr := uintptr(0x1000)
+	snapshot := MemforgeMemoryTimelineSnapshot{
+		Available:  true,
+		CapturedAt: now.Add(3 * time.Second),
+		Events: []MemforgeTimelineEvent{
+			{
+				Seq:               1,
+				Timestamp:         now,
+				Kind:              MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress:  addr,
+				AllocatorName:     "dynamic",
+				ArenaDataCapBytes: 1024,
+				ArenaTotalBytes:   1152,
+			},
+			{
+				Seq:                       2,
+				Timestamp:                 now.Add(time.Second),
+				Kind:                      MemforgeTimelineEventAllocatorGrow,
+				AllocatorAddress:          addr,
+				AllocatorName:             "dynamic",
+				PreviousArenaDataCapBytes: 1024,
+				ArenaDataCapBytes:         4096,
+				ArenaTotalBytes:           4224,
+			},
+		},
+	}
+
+	analysis := MemforgeMemoryTimelineAnalyze(snapshot, MemforgeStackFilter{})
+	if len(analysis.Arenas) != 1 {
+		t.Fatalf("expected one arena, got %+v", analysis.Arenas)
+	}
+	arena := analysis.Arenas[0]
+	if arena.CurrentArenaDataCapBytes != 4096 || arena.PeakArenaDataCapBytes != 4096 {
+		t.Fatalf("unexpected current/peak cap: %+v", arena)
+	}
+	if len(arena.CapacitySegments) != 2 {
+		t.Fatalf("expected two capacity segments, got %+v", arena.CapacitySegments)
+	}
+	if arena.CapacitySegments[0].DataCapBytes != 1024 || !arena.CapacitySegments[0].EndedAt.Equal(now.Add(time.Second)) {
+		t.Fatalf("unexpected first segment: %+v", arena.CapacitySegments[0])
+	}
+	if arena.CapacitySegments[1].DataCapBytes != 4096 || arena.CapacitySegments[1].GrownFromBytes != 1024 {
+		t.Fatalf("unexpected second segment: %+v", arena.CapacitySegments[1])
 	}
 }
 

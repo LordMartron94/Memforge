@@ -59,7 +59,7 @@ func FixedLinearAllocatorCreate(sizeBytes uint64) memcore.MarkRaw {
 		dataCapBytes:       sizeBytes,
 	}
 
-	memforgeAllocatorRegister(allocatorPtr, "Fixed Linear (Manual)")
+	memforgeAllocatorRegister(allocatorPtr, "Fixed Linear (Manual)", sizeBytes, totalSize)
 
 	return allocatorPtr
 }

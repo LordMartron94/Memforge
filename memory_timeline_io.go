@@ -18,17 +18,20 @@ type jsonlTimelineFreedAllocation struct {
 }
 
 type jsonlTimelineEvent struct {
-	Seq               uint64                         `json:"seq"`
-	Timestamp         string                         `json:"ts"`
-	Kind              string                         `json:"kind"`
-	AllocatorAddress  string                         `json:"allocator_addr"`
-	AllocatorName     string                         `json:"allocator_name"`
-	Stack             []string                       `json:"stack,omitempty"`
-	AllocationAddress string                         `json:"alloc_addr,omitempty"`
-	SizeBytes         uint64                         `json:"size_bytes,omitempty"`
-	OriginalSeq       uint64                         `json:"orig_seq,omitempty"`
-	OriginalCreatedAt string                         `json:"orig_ts,omitempty"`
-	Freed             []jsonlTimelineFreedAllocation `json:"freed,omitempty"`
+	Seq                       uint64                         `json:"seq"`
+	Timestamp                 string                         `json:"ts"`
+	Kind                      string                         `json:"kind"`
+	AllocatorAddress          string                         `json:"allocator_addr"`
+	AllocatorName             string                         `json:"allocator_name"`
+	Stack                     []string                       `json:"stack,omitempty"`
+	AllocationAddress         string                         `json:"alloc_addr,omitempty"`
+	SizeBytes                 uint64                         `json:"size_bytes,omitempty"`
+	OriginalSeq               uint64                         `json:"orig_seq,omitempty"`
+	OriginalCreatedAt         string                         `json:"orig_ts,omitempty"`
+	Freed                     []jsonlTimelineFreedAllocation `json:"freed,omitempty"`
+	ArenaDataCapBytes         uint64                         `json:"arena_data_cap_bytes,omitempty"`
+	ArenaTotalBytes           uint64                         `json:"arena_total_bytes,omitempty"`
+	PreviousArenaDataCapBytes uint64                         `json:"prev_arena_data_cap_bytes,omitempty"`
 }
 
 type jsonlTimelineSummary struct {
@@ -127,6 +130,9 @@ func timelineEventToJSONL(evt MemforgeTimelineEvent) jsonlTimelineEvent {
 	if !evt.OriginalCreatedAt.IsZero() {
 		out.OriginalCreatedAt = evt.OriginalCreatedAt.Format(time.RFC3339Nano)
 	}
+	out.ArenaDataCapBytes = evt.ArenaDataCapBytes
+	out.ArenaTotalBytes = evt.ArenaTotalBytes
+	out.PreviousArenaDataCapBytes = evt.PreviousArenaDataCapBytes
 	if len(evt.FreedAllocations) > 0 {
 		out.Freed = make([]jsonlTimelineFreedAllocation, len(evt.FreedAllocations))
 		for i, freed := range evt.FreedAllocations {
@@ -151,15 +157,18 @@ func timelineEventFromJSONL(record jsonlTimelineEvent) (MemforgeTimelineEvent, e
 	}
 
 	evt := MemforgeTimelineEvent{
-		Seq:               record.Seq,
-		Timestamp:         ts,
-		Kind:              MemforgeTimelineEventKind(record.Kind),
-		AllocatorAddress:  parseTimelineAddress(record.AllocatorAddress),
-		AllocatorName:     record.AllocatorName,
-		Stack:             strings.Join(record.Stack, " → "),
-		AllocationAddress: parseTimelineAddress(record.AllocationAddress),
-		SizeBytes:         record.SizeBytes,
-		OriginalSeq:       record.OriginalSeq,
+		Seq:                       record.Seq,
+		Timestamp:                 ts,
+		Kind:                      MemforgeTimelineEventKind(record.Kind),
+		AllocatorAddress:          parseTimelineAddress(record.AllocatorAddress),
+		AllocatorName:             record.AllocatorName,
+		Stack:                     strings.Join(record.Stack, " → "),
+		AllocationAddress:         parseTimelineAddress(record.AllocationAddress),
+		SizeBytes:                 record.SizeBytes,
+		OriginalSeq:               record.OriginalSeq,
+		ArenaDataCapBytes:         record.ArenaDataCapBytes,
+		ArenaTotalBytes:           record.ArenaTotalBytes,
+		PreviousArenaDataCapBytes: record.PreviousArenaDataCapBytes,
 	}
 	if record.OriginalCreatedAt != "" {
 		origTS, err := time.Parse(time.RFC3339Nano, record.OriginalCreatedAt)

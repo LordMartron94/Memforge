@@ -23,21 +23,25 @@ type MemforgeStackFilter struct {
 MemforgeArenaSummary is allocator-level telemetry derived from a timeline replay.
 */
 type MemforgeArenaSummary struct {
-	Name                 string
-	Address              uintptr
-	Destroyed            bool
-	CreatedAt            time.Time
-	DestroyedAt          time.Time
-	LastAllocationAt     time.Time
-	AgeAtCapture         time.Duration
-	EverAllocations      int
-	LiveAllocations      int
-	PeakLiveAllocations  int
-	EverBytes            uint64
-	LiveBytes            uint64
-	PeakLiveBytes        uint64
-	FilteredCreatorStack []string
-	Leaking              bool
+	Name                     string
+	Address                  uintptr
+	Destroyed                bool
+	CreatedAt                time.Time
+	DestroyedAt              time.Time
+	LastAllocationAt         time.Time
+	AgeAtCapture             time.Duration
+	EverAllocations          int
+	LiveAllocations          int
+	PeakLiveAllocations      int
+	EverBytes                uint64
+	LiveBytes                uint64
+	PeakLiveBytes            uint64
+	FilteredCreatorStack     []string
+	Leaking                  bool
+	CurrentArenaDataCapBytes uint64
+	CurrentArenaTotalBytes   uint64
+	PeakArenaDataCapBytes    uint64
+	CapacitySegments         []MemforgeArenaCapacitySegment
 }
 
 /*
@@ -170,7 +174,12 @@ func MemforgeMemoryTimelineAnalyze(snapshot MemforgeMemoryTimelineSnapshot, filt
 					FilteredCreatorStack: MemforgeStackFilterApply(evt.Stack, filter),
 				},
 			}
+			memforgeArenaCapacityApplyRegister(&arena.summary, evt)
 			arenas[evt.AllocatorAddress] = arena
+
+		case MemforgeTimelineEventAllocatorGrow:
+			arena := arenaForReplay(arenas, evt.AllocatorAddress, evt.AllocatorName)
+			memforgeArenaCapacityApplyGrow(&arena.summary, evt)
 
 		case MemforgeTimelineEventAllocation:
 			arena := arenaForReplay(arenas, evt.AllocatorAddress, evt.AllocatorName)
@@ -215,6 +224,7 @@ func MemforgeMemoryTimelineAnalyze(snapshot MemforgeMemoryTimelineSnapshot, filt
 				arena.summary.DestroyedAt = evt.Timestamp
 				arena.summary.LiveAllocations = 0
 				arena.summary.LiveBytes = 0
+				memforgeArenaCapacityCloseOpenSegment(&arena.summary, evt.Timestamp)
 			}
 			for seq, entry := range live {
 				if entry.allocatorAddress == evt.AllocatorAddress {
@@ -310,6 +320,56 @@ func removeLiveAllocation(arenas map[uintptr]*arenaReplayState, live map[uint64]
 		} else {
 			arena.summary.LiveBytes = 0
 		}
+	}
+}
+
+func memforgeArenaCapacityApplyRegister(summary *MemforgeArenaSummary, evt MemforgeTimelineEvent) {
+	if evt.ArenaDataCapBytes == 0 && evt.ArenaTotalBytes == 0 {
+		return
+	}
+	summary.CurrentArenaDataCapBytes = evt.ArenaDataCapBytes
+	summary.CurrentArenaTotalBytes = evt.ArenaTotalBytes
+	summary.PeakArenaDataCapBytes = evt.ArenaDataCapBytes
+	summary.CapacitySegments = append(summary.CapacitySegments, MemforgeArenaCapacitySegment{
+		StartedAt:    evt.Timestamp,
+		DataCapBytes: evt.ArenaDataCapBytes,
+		TotalBytes:   evt.ArenaTotalBytes,
+	})
+}
+
+func memforgeArenaCapacityApplyGrow(summary *MemforgeArenaSummary, evt MemforgeTimelineEvent) {
+	if evt.ArenaDataCapBytes == 0 {
+		return
+	}
+
+	grownFrom := evt.PreviousArenaDataCapBytes
+	if grownFrom == 0 && len(summary.CapacitySegments) > 0 {
+		grownFrom = summary.CapacitySegments[len(summary.CapacitySegments)-1].DataCapBytes
+	}
+	memforgeArenaCapacityCloseOpenSegment(summary, evt.Timestamp)
+
+	summary.CapacitySegments = append(summary.CapacitySegments, MemforgeArenaCapacitySegment{
+		StartedAt:      evt.Timestamp,
+		DataCapBytes:   evt.ArenaDataCapBytes,
+		TotalBytes:     evt.ArenaTotalBytes,
+		GrownFromBytes: grownFrom,
+	})
+	summary.CurrentArenaDataCapBytes = evt.ArenaDataCapBytes
+	if evt.ArenaTotalBytes > 0 {
+		summary.CurrentArenaTotalBytes = evt.ArenaTotalBytes
+	}
+	if evt.ArenaDataCapBytes > summary.PeakArenaDataCapBytes {
+		summary.PeakArenaDataCapBytes = evt.ArenaDataCapBytes
+	}
+}
+
+func memforgeArenaCapacityCloseOpenSegment(summary *MemforgeArenaSummary, endedAt time.Time) {
+	if len(summary.CapacitySegments) == 0 || endedAt.IsZero() {
+		return
+	}
+	last := &summary.CapacitySegments[len(summary.CapacitySegments)-1]
+	if last.EndedAt.IsZero() {
+		last.EndedAt = endedAt
 	}
 }
 

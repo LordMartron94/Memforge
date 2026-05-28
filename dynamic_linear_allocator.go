@@ -55,7 +55,7 @@ func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategyID 
 		growthStrategyID:   growthStrategyID,
 	}
 
-	memforgeAllocatorRegister(allocatorPtr, "Dynamic Linear (Manual)")
+	memforgeAllocatorRegister(allocatorPtr, "Dynamic Linear (Manual)", initialCapacityBytes, totalSize)
 
 	return allocatorPtr
 }
@@ -94,7 +94,7 @@ func DynamicLinearAllocatorCreateFunction(initialCapacityBytes uint64, growthStr
 		growthStrategyID:   growthStrategyID,
 	}
 
-	memforgeAllocatorRegister(allocatorPtr, "Dynamic Linear (Manual)")
+	memforgeAllocatorRegister(allocatorPtr, "Dynamic Linear (Manual)", initialCapacityBytes, totalSize)
 
 	return allocatorPtr
 }
@@ -122,7 +122,7 @@ func DynamicLinearAllocatorMalloc(allocator memcore.MarkRaw, sizeBytes, alignmen
 
 	alignedIdx := dynamicLinearAllocatorDataIdxGet(header, alignment)
 	if !dynamicLinearAllocatorCapacityGuarantee(header, sizeBytes, alignedIdx) {
-		header = dynamicLinearAllocatorGrow(header, alignedIdx+sizeBytes)
+		header = dynamicLinearAllocatorGrow(allocator, header, alignedIdx+sizeBytes)
 	}
 
 	offset := uintptr(alignedIdx)
@@ -141,7 +141,7 @@ func DynamicLinearAllocatorMallocUnsafe(allocator memcore.MarkRaw, sizeBytes, al
 
 	alignedIdx := dynamicLinearAllocatorDataIdxGet(header, alignment)
 	if !dynamicLinearAllocatorCapacityGuarantee(header, sizeBytes, alignedIdx) {
-		header = dynamicLinearAllocatorGrow(header, alignedIdx+sizeBytes)
+		header = dynamicLinearAllocatorGrow(allocator, header, alignedIdx+sizeBytes)
 	}
 
 	offset := uintptr(alignedIdx)
@@ -213,7 +213,7 @@ func (e GrowthStrategyViolation) Error() string {
 }
 
 //go:inline
-func dynamicLinearAllocatorGrow(header *DynamicLinearAllocator, neededCapacityBytes uint64) *DynamicLinearAllocator {
+func dynamicLinearAllocatorGrow(allocator memcore.MarkRaw, header *DynamicLinearAllocator, neededCapacityBytes uint64) *DynamicLinearAllocator {
 	prev := *header
 
 	strategy := memcore.MemcoreFunctionRetrieveTyped[GrowthStrategy](prev.growthStrategyID)
@@ -249,6 +249,7 @@ func dynamicLinearAllocatorGrow(header *DynamicLinearAllocator, neededCapacityBy
 	newHeaderPtr.allocatorTotalSize = newTotal
 	newHeaderPtr.dataCapBytes = newSize
 
+	memforgeAllocatorGrow(allocator, prev.dataCapBytes, newSize, newTotal)
 	memcore.MemcoreRegionBaseUpdate(newHeaderPtr.regionID, newBaseAddr)
 	return newHeaderPtr
 }

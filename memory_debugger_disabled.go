@@ -16,6 +16,9 @@ func MemforgeMemorySnapshotGet() MemforgeMemorySnapshot {
 // MemforgeMemoryDebug is a no-op when memforge_debug is disabled.
 func MemforgeMemoryDebug() {}
 
+// MemforgeMemoryDebugWithParams is a no-op when memforge_debug is disabled.
+func MemforgeMemoryDebugWithParams(_ MemforgeMemoryDebugParams) {}
+
 /*
 MemforgeMemoryTimelineSnapshotGet returns an unavailable snapshot when memforge_debug is disabled.
 */
@@ -28,7 +31,11 @@ func MemforgeMemoryTimelineSnapshotGet() MemforgeMemoryTimelineSnapshot {
 // MemforgeMemoryTimelineDebug is a no-op when memforge_debug is disabled.
 func MemforgeMemoryTimelineDebug(_ MemforgeMemoryTimelineRenderParams) {}
 
-func memforgeAllocatorRegister(allocatorPtr memcore.MarkRaw, name string) {}
+func memforgeAllocatorRegister(allocatorPtr memcore.MarkRaw, name string, arenaDataCapBytes, arenaTotalBytes uint64) {
+}
+
+func memforgeAllocatorGrow(allocatorPtr memcore.MarkRaw, previousDataCapBytes, newDataCapBytes, newTotalBytes uint64) {
+}
 
 func memforgeAllocationAdd(allocatorPtr, allocationPtr memcore.MarkRaw, sizeBytes uint64) {}
 

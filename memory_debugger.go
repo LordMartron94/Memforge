@@ -44,17 +44,20 @@ var timelineSeq uint64
 var internalPrefixes = []string{"runtime.", "reflect.", "memcore.", "testing.", "memforge.test"}
 
 type timelineEvent struct {
-	seq               uint64
-	timestamp         time.Time
-	kind              MemforgeTimelineEventKind
-	allocatorAddress  uintptr
-	allocatorName     string
-	stack             string
-	allocationAddress uintptr
-	sizeBytes         uint64
-	originalSeq       uint64
-	originalCreatedAt time.Time
-	freedAllocations  []MemforgeTimelineFreedAllocation
+	seq                       uint64
+	timestamp                 time.Time
+	kind                      MemforgeTimelineEventKind
+	allocatorAddress          uintptr
+	allocatorName             string
+	stack                     string
+	allocationAddress         uintptr
+	sizeBytes                 uint64
+	originalSeq               uint64
+	originalCreatedAt         time.Time
+	freedAllocations          []MemforgeTimelineFreedAllocation
+	arenaDataCapBytes         uint64
+	arenaTotalBytes           uint64
+	previousArenaDataCapBytes uint64
 }
 
 type allocatorStats struct {
@@ -139,17 +142,35 @@ func timelineFreedAllocationsFromLive(live []allocation) []MemforgeTimelineFreed
 }
 
 // Register a new allocator and record its creation site.
-func memforgeAllocatorRegister(allocatorPtr memcore.MarkRaw, name string) {
+func memforgeAllocatorRegister(allocatorPtr memcore.MarkRaw, name string, arenaDataCapBytes, arenaTotalBytes uint64) {
 	debugStats[allocatorPtr] = &allocatorStats{
 		allocatorName: name,
 		createdAt:     time.Now(),
 		creator:       memforgeCaptureCallStack(2),
 	}
 	appendTimelineEvent(timelineEvent{
-		kind:             MemforgeTimelineEventAllocatorRegister,
-		allocatorAddress: timelineAllocatorAddress(allocatorPtr),
-		allocatorName:    name,
-		stack:            memforgeCaptureCallStack(2),
+		kind:              MemforgeTimelineEventAllocatorRegister,
+		allocatorAddress:  timelineAllocatorAddress(allocatorPtr),
+		allocatorName:     name,
+		stack:             memforgeCaptureCallStack(2),
+		arenaDataCapBytes: arenaDataCapBytes,
+		arenaTotalBytes:   arenaTotalBytes,
+	})
+}
+
+func memforgeAllocatorGrow(allocatorPtr memcore.MarkRaw, previousDataCapBytes, newDataCapBytes, newTotalBytes uint64) {
+	allocatorName := ""
+	if stats := debugStats[allocatorPtr]; stats != nil {
+		allocatorName = stats.allocatorName
+	}
+	appendTimelineEvent(timelineEvent{
+		kind:                      MemforgeTimelineEventAllocatorGrow,
+		allocatorAddress:          timelineAllocatorAddress(allocatorPtr),
+		allocatorName:             allocatorName,
+		stack:                     memforgeCaptureCallStack(2),
+		arenaDataCapBytes:         newDataCapBytes,
+		arenaTotalBytes:           newTotalBytes,
+		previousArenaDataCapBytes: previousDataCapBytes,
 	})
 }
 
@@ -394,144 +415,27 @@ func memforgeAddressFromMark(mark memcore.MarkRaw) uintptr {
 	return uintptr(memcore.MemcoreMarkDereference(mark))
 }
 
-// MemforgeMemoryDebug prints a focused summary of allocator usage and leaks.
+/*
+MemforgeMemoryDebug prints allocator usage and leaks using structured timeline analysis.
+*/
 func MemforgeMemoryDebug() {
-	if len(debugStats) == 0 {
-		fmt.Printf("\n%s╔════════════════════════════════════════════════════════════════════════════╗%s\n", colorBoldCyan, colorReset)
-		fmt.Printf("%s║                        MEMFORGE MEMORY DEBUGGER                            ║%s\n", colorBoldCyan, colorReset)
-		fmt.Printf("%s╚════════════════════════════════════════════════════════════════════════════╝%s\n", colorBoldCyan, colorReset)
-		fmt.Printf("\n%s🧩 No allocators registered%s\n\n", colorYellow, colorReset)
-		return
-	}
-
-	sb := strings.Builder{}
-
-	writeHeader(&sb)
-	typeGroups := groupAllocatorsByType(debugStats)
-	typeNames := sortedTypeNames(typeGroups)
-
-	var totals globalTotals
-
-	for _, name := range typeNames {
-		ptrs := typeGroups[name]
-		typeTotal := computeTypeTotals(ptrs)
-
-		totals.add(typeTotal)
-
-		writeTypeSummary(&sb, name, ptrs, typeTotal)
-	}
-
-	writeGlobalSummary(&sb, totals, len(typeNames), len(debugStats))
-	fmt.Println(sb.String())
+	MemforgeMemoryDebugWithParams(MemforgeMemoryDebugParams{})
 }
 
-// --- helpers ---
-
-type globalTotals struct {
-	totalAllocs, totalLiveAllocs int
-	totalBytes, totalLiveBytes   uint64
+/*
+MemforgeMemoryDebugWithParams prints timeline analysis with optional stack filtering and granular events.
+*/
+func MemforgeMemoryDebugWithParams(params MemforgeMemoryDebugParams) {
+	snapshot := MemforgeMemoryTimelineSnapshotGet()
+	analysis := MemforgeMemoryTimelineAnalyze(snapshot, params.StackFilter)
+	memforgeMemoryAnalysisDebugPrint(analysis, params.Timeline, memforgeMemoryAnalysisPrintOptions{
+		title: "MEMFORGE MEMORY DEBUGGER",
+	})
 }
 
-func (t *globalTotals) add(other globalTotals) {
-	t.totalAllocs += other.totalAllocs
-	t.totalLiveAllocs += other.totalLiveAllocs
-	t.totalBytes += other.totalBytes
-	t.totalLiveBytes += other.totalLiveBytes
-}
-
-func writeHeader(sb *strings.Builder) {
-	const boxWidth = 100
-	sb.WriteString(fmt.Sprintf("\n%s╔%s╗%s\n", colorBoldCyan, strings.Repeat("═", boxWidth-2), colorReset))
-
-	headerText := "MEMFORGE MEMORY DEBUGGER"
-	padding := (boxWidth - 2 - len(headerText)) / 2
-	sb.WriteString(fmt.Sprintf("%s║%s%s%s%s║%s\n",
-		colorBoldCyan,
-		strings.Repeat(" ", padding),
-		headerText,
-		strings.Repeat(" ", boxWidth-2-padding-len(headerText)),
-		colorBoldCyan,
-		colorReset))
-
-	timeText := fmt.Sprintf("Time: %s", time.Now().Format("2006-01-02 15:04:05"))
-	timePadding := (boxWidth - 2 - len(timeText)) / 2
-	sb.WriteString(fmt.Sprintf("%s║%s%s%s%s%s║%s\n",
-		colorBoldCyan,
-		strings.Repeat(" ", timePadding),
-		colorGray,
-		timeText,
-		colorReset,
-		strings.Repeat(" ", boxWidth-2-timePadding-len(timeText)),
-		colorReset))
-
-	sb.WriteString(fmt.Sprintf("%s╚%s╝%s\n\n", colorBoldCyan, strings.Repeat("═", boxWidth-2), colorReset))
-}
-
-func writeGlobalSummary(sb *strings.Builder, totals globalTotals, typeCount, allocatorCount int) {
-	const boxWidth = 100
-
-	destroyedCount := 0
-	for _, st := range debugStats {
-		if st.destroyed {
-			destroyedCount++
-		}
-	}
-	activeCount := allocatorCount - destroyedCount
-
-	sb.WriteString(fmt.Sprintf("\n%s┌─ Global Summary %s\n", colorBoldWhite, strings.Repeat("─", boxWidth-18)))
-
-	// Statistics
-	sb.WriteString(fmt.Sprintf("%s│%s  %sAllocator Types:%s %s%d%s\n",
-		colorBoldWhite, colorReset, colorWhite, colorReset, colorCyan, typeCount, colorReset))
-
-	sb.WriteString(fmt.Sprintf("%s│%s  %sTotal Allocators:%s %s%d%s",
-		colorBoldWhite, colorReset, colorWhite, colorReset, colorBoldGreen, allocatorCount, colorReset))
-	sb.WriteString(fmt.Sprintf("  %s(%sActive:%s %s%d%s  %sDestroyed:%s %s%d%s%s)%s\n",
-		colorGray, colorWhite, colorReset, colorGreen, activeCount, colorReset,
-		colorWhite, colorReset, colorYellow, destroyedCount, colorReset, colorGray, colorReset))
-
-	sb.WriteString(fmt.Sprintf("%s│%s\n", colorBoldWhite, colorReset))
-
-	// Memory statistics
-	sb.WriteString(fmt.Sprintf("%s│%s  %sTotal Allocations:%s %s%d%s\n",
-		colorBoldWhite, colorReset, colorWhite, colorReset, colorCyan, totals.totalAllocs, colorReset))
-
-	liveAllocsColor := colorGreen
-	if totals.totalLiveAllocs > 0 {
-		liveAllocsColor = colorRed
-	}
-	sb.WriteString(fmt.Sprintf("%s│%s  %sLive Allocations:%s  %s%d%s\n",
-		colorBoldWhite, colorReset, colorWhite, colorReset, liveAllocsColor, totals.totalLiveAllocs, colorReset))
-
-	sb.WriteString(fmt.Sprintf("%s│%s\n", colorBoldWhite, colorReset))
-
-	sb.WriteString(fmt.Sprintf("%s│%s  %sTotal Bytes Allocated:%s %s%s%s\n",
-		colorBoldWhite, colorReset, colorWhite, colorReset, colorCyan, humanBytes(float64(totals.totalBytes)), colorReset))
-
-	liveBytesColor := colorGreen
-	if totals.totalLiveBytes > 0 {
-		liveBytesColor = colorYellow
-	}
-	sb.WriteString(fmt.Sprintf("%s│%s  %sLive Bytes:%s           %s%s%s\n",
-		colorBoldWhite, colorReset, colorWhite, colorReset, liveBytesColor, humanBytes(float64(totals.totalLiveBytes)), colorReset))
-
-	sb.WriteString(fmt.Sprintf("%s│%s\n", colorBoldWhite, colorReset))
-
-	// Final verdict
-	if totals.totalLiveAllocs > 0 {
-		sb.WriteString(fmt.Sprintf("%s│%s  %s⚠️  MEMORY LEAK DETECTED%s\n",
-			colorBoldWhite, colorReset, colorBoldRed, colorReset))
-		sb.WriteString(fmt.Sprintf("%s│%s  %s%d live allocation%s remain%s across all allocators\n",
-			colorBoldWhite, colorReset, colorRed, totals.totalLiveAllocs,
-			pluralize(totals.totalLiveAllocs), colorReset))
-		sb.WriteString(fmt.Sprintf("%s│%s  %sLive memory: %s%s\n",
-			colorBoldWhite, colorReset, colorRed, humanBytes(float64(totals.totalLiveBytes)), colorReset))
-	} else {
-		sb.WriteString(fmt.Sprintf("%s│%s  %s✅ All memory freed — no leaks detected%s\n",
-			colorBoldWhite, colorReset, colorBoldGreen, colorReset))
-	}
-
-	sb.WriteString(fmt.Sprintf("%s└%s\n\n", colorBoldWhite, strings.Repeat("─", boxWidth-1)))
+type memforgeMemoryAnalysisPrintOptions struct {
+	title              string
+	showEventKindLines bool
 }
 
 func groupAllocatorsByType(stats map[memcore.MarkRaw]*allocatorStats) map[string][]memcore.MarkRaw {
@@ -551,139 +455,6 @@ func sortedTypeNames(group map[string][]memcore.MarkRaw) []string {
 	return names
 }
 
-func computeTypeTotals(ptrs []memcore.MarkRaw) globalTotals {
-	var totals globalTotals
-	for _, p := range ptrs {
-		st := debugStats[p]
-		totals.totalAllocs += len(st.allAllocations)
-		totals.totalLiveAllocs += len(st.currentlyLiveAllocations)
-		totals.totalBytes += st.totalBytes
-		totals.totalLiveBytes += st.liveBytes
-	}
-	return totals
-}
-
-func writeTypeSummary(sb *strings.Builder, name string, ptrs []memcore.MarkRaw, totals globalTotals) {
-	const boxWidth = 100
-
-	destroyedCount := 0
-	for _, addr := range ptrs {
-		if debugStats[addr].destroyed {
-			destroyedCount++
-		}
-	}
-	activeCount := len(ptrs) - destroyedCount
-
-	// Type header
-	remainingWidth := boxWidth - len(name) - len(fmt.Sprintf(" [%d allocators]", len(ptrs))) - 4
-	if remainingWidth < 0 {
-		remainingWidth = 0
-	}
-
-	sb.WriteString(fmt.Sprintf("%s┌─ %s%s%s%s %s%s\n",
-		colorBoldYellow,
-		colorBoldMagenta,
-		name,
-		colorReset,
-		colorGray,
-		fmt.Sprintf("[%d allocator%s]", len(ptrs), pluralize(len(ptrs))),
-		strings.Repeat("─", remainingWidth)))
-
-	// Summary statistics
-	sb.WriteString(fmt.Sprintf("%s│%s  %sActive:%s %s%d%s  %sDestroyed:%s %s%d%s  ",
-		colorYellow, colorReset,
-		colorWhite, colorReset, colorGreen, activeCount, colorReset,
-		colorWhite, colorReset, colorGray, destroyedCount, colorReset))
-
-	leakColor := colorGreen
-	leakSymbol := "✅"
-	if totals.totalLiveAllocs > 0 {
-		leakColor = colorRed
-		leakSymbol = "🚨"
-	}
-	sb.WriteString(fmt.Sprintf("%sLeaks:%s %s%d%s %s%s\n",
-		colorWhite, colorReset, leakColor, totals.totalLiveAllocs, colorReset, leakSymbol, colorReset))
-
-	sb.WriteString(fmt.Sprintf("%s│%s  %sTotal:%s %s%s%s  %sLive:%s %s%s%s\n",
-		colorYellow, colorReset,
-		colorWhite, colorReset, colorCyan, humanBytes(float64(totals.totalBytes)), colorReset,
-		colorWhite, colorReset, colorYellow, humanBytes(float64(totals.totalLiveBytes)), colorReset))
-
-	sb.WriteString(fmt.Sprintf("%s│%s\n", colorYellow, colorReset))
-
-	// Show allocator details if there are leaks or few allocators
-	if len(ptrs) <= 5 || totals.totalLiveAllocs > 0 {
-		for i, addr := range ptrs {
-			writeAllocatorSummary(sb, addr, i == len(ptrs)-1)
-		}
-	} else {
-		sb.WriteString(fmt.Sprintf("%s│%s  %s... %d more allocators (use fewer allocators or check for leaks to see details)%s\n",
-			colorYellow, colorReset, colorGray, len(ptrs)-5, colorReset))
-	}
-
-	sb.WriteString(fmt.Sprintf("%s└%s%s\n\n", colorYellow, strings.Repeat("─", boxWidth-1), colorReset))
-}
-
-func writeAllocatorSummary(sb *strings.Builder, addr memcore.MarkRaw, isLast bool) {
-	st := debugStats[addr]
-	if len(st.allAllocations) == 0 {
-		return
-	}
-
-	allocCount := len(st.allAllocations)
-	liveCount := len(st.currentlyLiveAllocations)
-	if allocCount == 0 && liveCount == 0 {
-		return
-	}
-
-	var allocVal string
-	if st.destroyed {
-		allocVal = fmt.Sprintf("%s<destroyed>%s", colorGray, colorReset)
-	} else {
-		allocVal = fmt.Sprintf("%s0x%016x%s", colorBlue, memcore.MemcoreMarkDereference(addr), colorReset)
-	}
-
-	// Status and icon
-	status, statusColor, icon := allocatorStatusInfo(st)
-
-	sb.WriteString(fmt.Sprintf("%s│%s  %s%s%s %s  %sAllocs:%s %s%-4d%s %sLive:%s %s%-4d%s %sBytes:%s %s%-12s%s %s%s%s\n",
-		colorYellow, colorReset,
-		statusColor, icon, colorReset,
-		allocVal,
-		colorWhite, colorReset, colorCyan, allocCount, colorReset,
-		colorWhite, colorReset, colorYellow, liveCount, colorReset,
-		colorWhite, colorReset, colorMagenta, humanBytes(float64(st.totalBytes)), colorReset,
-		statusColor, status, colorReset))
-
-	// Creation info
-	age := time.Since(st.createdAt)
-	sb.WriteString(fmt.Sprintf("%s│%s     %s└─ Created:%s %s%s%s %s(%s ago)%s\n",
-		colorYellow, colorReset,
-		colorGray, colorReset,
-		colorGray, st.createdAt.Format("15:04:05"), colorReset,
-		colorGray, formatDuration(age), colorReset))
-
-	// Creator callstack (indented)
-	creatorLines := strings.Split(st.creator, "\n")
-	for i, line := range creatorLines {
-		if i == 0 {
-			sb.WriteString(fmt.Sprintf("%s│%s        %s%s%s\n",
-				colorYellow, colorReset, colorCyan, strings.TrimSpace(line), colorReset))
-		} else {
-			sb.WriteString(fmt.Sprintf("%s│%s        %s%s%s\n",
-				colorYellow, colorReset, colorGray, strings.TrimSpace(line), colorReset))
-		}
-	}
-
-	if liveCount > 0 {
-		writeLiveAllocations(sb, st.currentlyLiveAllocations)
-	}
-
-	if !isLast {
-		sb.WriteString(fmt.Sprintf("%s│%s\n", colorYellow, colorReset))
-	}
-}
-
 func allocatorStatusInfo(st *allocatorStats) (string, string, string) {
 	switch {
 	case st.destroyed && len(st.currentlyLiveAllocations) > 0:
@@ -694,55 +465,6 @@ func allocatorStatusInfo(st *allocatorStats) (string, string, string) {
 		return "ACTIVE + LEAKING", colorBoldYellow, "⚠️"
 	default:
 		return "ACTIVE", colorGreen, "●"
-	}
-}
-
-func writeLiveAllocations(sb *strings.Builder, allocs []allocation) {
-	live := slices.Clone(allocs)
-	slices.SortFunc(live, func(a, b allocation) int {
-		switch {
-		case a.sizeBytes > b.sizeBytes:
-			return -1
-		case a.sizeBytes < b.sizeBytes:
-			return 1
-		default:
-			return 0
-		}
-	})
-
-	sb.WriteString(fmt.Sprintf("%s│%s\n", colorYellow, colorReset))
-	sb.WriteString(fmt.Sprintf("%s│%s     %s🔴 Live Allocations (top %d by size):%s\n",
-		colorYellow, colorReset, colorBoldRed, min(3, len(live)), colorReset))
-
-	for i := 0; i < min(3, len(live)); i++ {
-		a := live[i]
-		age := time.Since(a.timestamp)
-
-		sb.WriteString(fmt.Sprintf("%s│%s        %s•%s %sAddr:%s %s0x%016x%s  %sSize:%s %s%-10s%s %s(%s ago)%s\n",
-			colorYellow, colorReset,
-			colorRed, colorReset,
-			colorWhite, colorReset,
-			colorBlue, memcore.MemcoreMarkDereference(a.ptr), colorReset,
-			colorWhite, colorReset,
-			colorMagenta, humanBytes(float64(a.sizeBytes)), colorReset,
-			colorGray, formatDuration(age), colorReset))
-
-		// Callstack for allocation
-		callstackLines := strings.Split(a.creator, " → ")
-		for j, line := range callstackLines {
-			if j == 0 {
-				sb.WriteString(fmt.Sprintf("%s│%s          %s%s%s\n",
-					colorYellow, colorReset, colorCyan, strings.TrimSpace(line), colorReset))
-			} else {
-				sb.WriteString(fmt.Sprintf("%s│%s          %s%s%s\n",
-					colorYellow, colorReset, colorGray, strings.TrimSpace(line), colorReset))
-			}
-		}
-	}
-
-	if len(live) > 3 {
-		sb.WriteString(fmt.Sprintf("%s│%s        %s... and %d more leaked allocation%s%s\n",
-			colorYellow, colorReset, colorRed, len(live)-3, pluralize(len(live)-3), colorReset))
 	}
 }
 
@@ -775,20 +497,6 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%.1fd", d.Hours()/24)
 }
 
-func pluralize(count int) string {
-	if count == 1 {
-		return ""
-	}
-	return "s"
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 /*
 MemforgeMemoryTimelineSnapshotGet returns a copy of all recorded timeline events.
 */
@@ -807,16 +515,19 @@ func MemforgeMemoryTimelineSnapshotGet() MemforgeMemoryTimelineSnapshot {
 
 func timelineEventToPublic(evt timelineEvent) MemforgeTimelineEvent {
 	out := MemforgeTimelineEvent{
-		Seq:               evt.seq,
-		Timestamp:         evt.timestamp,
-		Kind:              evt.kind,
-		AllocatorAddress:  evt.allocatorAddress,
-		AllocatorName:     evt.allocatorName,
-		Stack:             evt.stack,
-		AllocationAddress: evt.allocationAddress,
-		SizeBytes:         evt.sizeBytes,
-		OriginalSeq:       evt.originalSeq,
-		OriginalCreatedAt: evt.originalCreatedAt,
+		Seq:                       evt.seq,
+		Timestamp:                 evt.timestamp,
+		Kind:                      evt.kind,
+		AllocatorAddress:          evt.allocatorAddress,
+		AllocatorName:             evt.allocatorName,
+		Stack:                     evt.stack,
+		AllocationAddress:         evt.allocationAddress,
+		SizeBytes:                 evt.sizeBytes,
+		OriginalSeq:               evt.originalSeq,
+		OriginalCreatedAt:         evt.originalCreatedAt,
+		ArenaDataCapBytes:         evt.arenaDataCapBytes,
+		ArenaTotalBytes:           evt.arenaTotalBytes,
+		PreviousArenaDataCapBytes: evt.previousArenaDataCapBytes,
 	}
 	if len(evt.freedAllocations) > 0 {
 		out.FreedAllocations = slices.Clone(evt.freedAllocations)
@@ -830,25 +541,29 @@ MemforgeMemoryTimelineDebug prints an arena-focused analysis of the recorded tim
 func MemforgeMemoryTimelineDebug(params MemforgeMemoryTimelineRenderParams) {
 	snapshot := MemforgeMemoryTimelineSnapshotGet()
 	analysis := MemforgeMemoryTimelineAnalyze(snapshot, MemforgeStackFilter{})
-	memforgeMemoryTimelineAnalysisDebugPrint(analysis, params)
+	memforgeMemoryAnalysisDebugPrint(analysis, params, memforgeMemoryAnalysisPrintOptions{
+		title:              "MEMFORGE MEMORY ANALYSIS",
+		showEventKindLines: true,
+	})
 }
 
-func memforgeMemoryTimelineAnalysisDebugPrint(analysis MemforgeMemoryTimelineAnalysis, params MemforgeMemoryTimelineRenderParams) {
-	fmt.Printf("\n%s=== MEMFORGE MEMORY ANALYSIS ===%s\n", colorBoldCyan, colorReset)
+func memforgeMemoryAnalysisDebugPrint(analysis MemforgeMemoryTimelineAnalysis, params MemforgeMemoryTimelineRenderParams, opts memforgeMemoryAnalysisPrintOptions) {
+	title := opts.title
+	if title == "" {
+		title = "MEMFORGE MEMORY ANALYSIS"
+	}
+
+	fmt.Printf("\n%s=== %s ===%s\n", colorBoldCyan, title, colorReset)
 	if !analysis.Available {
-		fmt.Printf("%s(unavailable)%s\n\n", colorYellow, colorReset)
+		fmt.Printf("%s(unavailable — rebuild with -tags memforge_debug)%s\n\n", colorYellow, colorReset)
 		return
 	}
-	if analysis.TotalEvents == 0 {
-		fmt.Printf("%s(no events recorded)%s\n\n", colorYellow, colorReset)
+	if analysis.TotalEvents == 0 && analysis.TotalAllocators == 0 {
+		fmt.Printf("%s🧩 No allocators registered%s\n\n", colorYellow, colorReset)
 		return
 	}
 
-	fmt.Printf("%sEvents:%s %d  %sLive:%s %d alloc / %s  %sLeaking arenas:%s %d\n\n",
-		colorWhite, colorReset, analysis.TotalEvents,
-		colorWhite, colorReset, analysis.TotalLiveAllocations, humanBytes(float64(analysis.TotalLiveBytes)),
-		colorWhite, colorReset, analysis.LeakingAllocators)
-
+	memforgeMemoryAnalysisSummaryDebugPrint(analysis, opts.showEventKindLines)
 	memforgeArenaSummaryDebugPrint(analysis.Arenas)
 
 	if analysis.TotalLiveAllocations > 0 {
@@ -874,6 +589,62 @@ func memforgeMemoryTimelineAnalysisDebugPrint(analysis MemforgeMemoryTimelineAna
 	fmt.Println()
 }
 
+func memforgeMemoryAnalysisSummaryDebugPrint(analysis MemforgeMemoryTimelineAnalysis, showEventKinds bool) {
+	fmt.Printf("%sEvents    :%s %d\n", colorWhite, colorReset, analysis.TotalEvents)
+	fmt.Printf("%sAllocators:%s %d Total (%s%d Active%s, %s%d Destroyed%s)\n",
+		colorWhite, colorReset, analysis.TotalAllocators,
+		colorGreen, analysis.ActiveAllocators, colorReset,
+		colorYellow, analysis.DestroyedAllocators, colorReset)
+	fmt.Printf("%sLive      :%s %d Allocations, %s, %d Leaking Arenas\n",
+		colorWhite, colorReset,
+		analysis.TotalLiveAllocations,
+		humanBytes(float64(analysis.TotalLiveBytes)),
+		analysis.LeakingAllocators)
+
+	if showEventKinds && analysis.TotalEvents > 0 {
+		memforgeMemoryAnalysisEventKindsDebugPrint(analysis.Events)
+	}
+
+	fmt.Printf("%sVerdict   :%s ", colorWhite, colorReset)
+	if analysis.LeakDetected {
+		fmt.Printf("%sMEMORY LEAK DETECTED%s\n", colorBoldRed, colorReset)
+	} else {
+		fmt.Printf("%sNo leaks detected%s\n", colorBoldGreen, colorReset)
+	}
+	fmt.Println()
+}
+
+func memforgeMemoryAnalysisEventKindsDebugPrint(events []MemforgeTimelineEvent) {
+	kindCounts := make(map[string]int)
+	var firstTS, lastTS time.Time
+	for i, evt := range events {
+		kindCounts[string(evt.Kind)]++
+		if i == 0 || evt.Timestamp.Before(firstTS) {
+			firstTS = evt.Timestamp
+		}
+		if i == 0 || evt.Timestamp.After(lastTS) {
+			lastTS = evt.Timestamp
+		}
+	}
+
+	if !firstTS.IsZero() && !lastTS.IsZero() {
+		fmt.Printf("%sSpan      :%s %s to %s (%s)\n",
+			colorGray, colorReset,
+			firstTS.Format("15:04:05.000"),
+			lastTS.Format("15:04:05.000"),
+			lastTS.Sub(firstTS).Round(time.Millisecond))
+	}
+
+	kinds := make([]string, 0, len(kindCounts))
+	for kind := range kindCounts {
+		kinds = append(kinds, kind)
+	}
+	slices.Sort(kinds)
+	for _, kind := range kinds {
+		fmt.Printf("%s  %-28s %s%d\n", colorGray, kind+":", colorReset, kindCounts[kind])
+	}
+}
+
 func memforgeArenaSummaryDebugPrint(arenas []MemforgeArenaSummary) {
 	fmt.Printf("%s\nArena Summary:%s\n", colorBoldYellow, colorReset)
 	for _, arena := range arenas {
@@ -889,9 +660,58 @@ func memforgeArenaSummaryDebugPrint(arenas []MemforgeArenaSummary) {
 			arena.LiveAllocations, humanBytes(float64(arena.LiveBytes)),
 			arena.PeakLiveAllocations, humanBytes(float64(arena.PeakLiveBytes)),
 			arena.EverAllocations, humanBytes(float64(arena.EverBytes)))
+		memforgeArenaCapacityDebugPrint(arena)
 		if len(arena.FilteredCreatorStack) > 0 {
 			fmt.Printf("    created by: %s%s%s\n", colorCyan, strings.Join(arena.FilteredCreatorStack, " → "), colorReset)
 		}
+	}
+}
+
+func memforgeArenaCapacityDebugPrint(arena MemforgeArenaSummary) {
+	if arena.CurrentArenaDataCapBytes == 0 && len(arena.CapacitySegments) == 0 {
+		return
+	}
+
+	peakCap := arena.PeakArenaDataCapBytes
+	if peakCap == 0 {
+		peakCap = arena.CurrentArenaDataCapBytes
+	}
+
+	line := fmt.Sprintf("    %sArena:%s %s", colorWhite, colorReset, humanBytes(float64(arena.CurrentArenaDataCapBytes)))
+	if arena.CurrentArenaTotalBytes > 0 {
+		line += fmt.Sprintf("  %sMmap:%s %s", colorWhite, colorReset, humanBytes(float64(arena.CurrentArenaTotalBytes)))
+	}
+	if peakCap > arena.CurrentArenaDataCapBytes {
+		line += fmt.Sprintf("  %sPeak arena:%s %s", colorWhite, colorReset, humanBytes(float64(peakCap)))
+	}
+	if arena.CurrentArenaDataCapBytes > 0 && arena.LiveBytes > 0 {
+		utilPct := float64(arena.LiveBytes) * 100 / float64(arena.CurrentArenaDataCapBytes)
+		line += fmt.Sprintf("  %sLive util:%s %.1f%%", colorWhite, colorReset, utilPct)
+	}
+	fmt.Println(line)
+
+	if len(arena.CapacitySegments) <= 1 {
+		return
+	}
+
+	fmt.Printf("    %sCapacity segments:%s\n", colorGray, colorReset)
+	for _, segment := range arena.CapacitySegments {
+		endLabel := "capture"
+		if !segment.EndedAt.IsZero() {
+			endLabel = segment.EndedAt.Format("15:04:05.000")
+		}
+		growthNote := ""
+		if segment.GrownFromBytes > 0 && segment.DataCapBytes > segment.GrownFromBytes {
+			growthNote = fmt.Sprintf("  %s(+%s)%s",
+				colorGray,
+				humanBytes(float64(segment.DataCapBytes-segment.GrownFromBytes)),
+				colorReset)
+		}
+		fmt.Printf("      %s – %s  %s%s\n",
+			segment.StartedAt.Format("15:04:05.000"),
+			endLabel,
+			humanBytes(float64(segment.DataCapBytes)),
+			growthNote)
 	}
 }
 
@@ -914,6 +734,17 @@ func writeTimelineEventLine(evt *MemforgeTimelineEvent, expandRegional bool) {
 		colorWhite, colorReset, evt.AllocatorName, formatTimelineAddress(evt.AllocatorAddress))
 
 	switch evt.Kind {
+	case MemforgeTimelineEventAllocatorRegister, MemforgeTimelineEventAllocatorGrow:
+		if evt.ArenaDataCapBytes > 0 {
+			line := fmt.Sprintf("  %sArena data cap:%s %s", colorWhite, colorReset, humanBytes(float64(evt.ArenaDataCapBytes)))
+			if evt.ArenaTotalBytes > 0 {
+				line += fmt.Sprintf("  %sMmap total:%s %s", colorWhite, colorReset, humanBytes(float64(evt.ArenaTotalBytes)))
+			}
+			if evt.Kind == MemforgeTimelineEventAllocatorGrow && evt.PreviousArenaDataCapBytes > 0 {
+				line += fmt.Sprintf("  %s(from %s)%s", colorGray, humanBytes(float64(evt.PreviousArenaDataCapBytes)), colorReset)
+			}
+			fmt.Println(line)
+		}
 	case MemforgeTimelineEventAllocation, MemforgeTimelineEventFreeManual:
 		fmt.Printf("  %sAddress:%s %s  %sSize:%s %s\n",
 			colorWhite, colorReset, formatTimelineAddress(evt.AllocationAddress),

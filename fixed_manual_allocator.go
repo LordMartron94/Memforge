@@ -114,7 +114,7 @@ func FixedManualAllocatorCreate(sizeBytes uint64) memcore.MarkRaw {
 		regionIdxFailureCount: 0,
 	}
 
-	memforgeAllocatorRegister(allocatorPtr, "Fixed Manual (Pointer)")
+	memforgeAllocatorRegister(allocatorPtr, "Fixed Manual (Pointer)", sizeBytes, totalSize)
 	return allocatorPtr
 }
 

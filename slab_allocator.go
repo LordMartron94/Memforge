@@ -79,7 +79,8 @@ func SlabAllocatorCreate[T any](capacity uint64) memcore.MarkRaw {
 		metaAllocator:      metaAlloc,
 	}
 
-	memforgeAllocatorRegister(headerPtr, "Fixed Slab (Manual)")
+	dataCapBytes := slotSize * capacity
+	memforgeAllocatorRegister(headerPtr, "Fixed Slab (Manual)", dataCapBytes, totalBytes)
 	return headerPtr
 }
 
