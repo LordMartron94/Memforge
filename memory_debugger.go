@@ -600,6 +600,14 @@ func memforgeMemoryAnalysisSummaryDebugPrint(analysis MemforgeMemoryTimelineAnal
 		analysis.TotalLiveAllocations,
 		humanBytes(float64(analysis.TotalLiveBytes)),
 		analysis.LeakingAllocators)
+	fmt.Printf("%sPeak      :%s %d Allocations, %s\n",
+		colorWhite, colorReset,
+		analysis.TotalPeakLiveAllocations,
+		humanBytes(float64(analysis.TotalPeakLiveBytes)))
+	fmt.Printf("%sEver      :%s %d Allocations, %s\n",
+		colorWhite, colorReset,
+		analysis.TotalEverAllocations,
+		humanBytes(float64(analysis.TotalEverBytes)))
 
 	if showEventKinds && analysis.TotalEvents > 0 {
 		memforgeMemoryAnalysisEventKindsDebugPrint(analysis.Events)

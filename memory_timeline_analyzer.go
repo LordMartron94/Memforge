@@ -60,21 +60,25 @@ type MemforgeAllocationStackGroup struct {
 MemforgeMemoryTimelineAnalysis is the focus-driven view of a timeline snapshot.
 */
 type MemforgeMemoryTimelineAnalysis struct {
-	Available            bool
-	CapturedAt           time.Time
-	SourceKind           string
-	SourcePath           string
-	Arenas               []MemforgeArenaSummary
-	LeakGroups           []MemforgeAllocationStackGroup
-	Events               []MemforgeTimelineEvent
-	TotalEvents          int
-	TotalAllocators      int
-	ActiveAllocators     int
-	DestroyedAllocators  int
-	LeakingAllocators    int
-	TotalLiveAllocations int
-	TotalLiveBytes       uint64
-	LeakDetected         bool
+	Available                bool
+	CapturedAt               time.Time
+	SourceKind               string
+	SourcePath               string
+	Arenas                   []MemforgeArenaSummary
+	LeakGroups               []MemforgeAllocationStackGroup
+	Events                   []MemforgeTimelineEvent
+	TotalEvents              int
+	TotalAllocators          int
+	ActiveAllocators         int
+	DestroyedAllocators      int
+	LeakingAllocators        int
+	TotalLiveAllocations     int
+	TotalLiveBytes           uint64
+	TotalPeakLiveAllocations int
+	TotalPeakLiveBytes       uint64
+	TotalEverAllocations     int
+	TotalEverBytes           uint64
+	LeakDetected             bool
 }
 
 type arenaReplayState struct {
@@ -292,6 +296,10 @@ func MemforgeMemoryTimelineAnalyze(snapshot MemforgeMemoryTimelineSnapshot, filt
 		}
 		analysis.TotalLiveAllocations += arena.LiveAllocations
 		analysis.TotalLiveBytes += arena.LiveBytes
+		analysis.TotalPeakLiveAllocations += arena.PeakLiveAllocations
+		analysis.TotalPeakLiveBytes += arena.PeakLiveBytes
+		analysis.TotalEverAllocations += arena.EverAllocations
+		analysis.TotalEverBytes += arena.EverBytes
 	}
 	analysis.LeakDetected = analysis.TotalLiveAllocations > 0
 	return analysis

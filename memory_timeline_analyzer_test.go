@@ -73,6 +73,12 @@ func TestMemforgeMemoryTimelineAnalyzeReplay(t *testing.T) {
 	if analysis.Arenas[0].CurrentArenaDataCapBytes != 512 || analysis.Arenas[0].CurrentArenaTotalBytes != 640 {
 		t.Fatalf("unexpected arena capacity: %+v", analysis.Arenas[0])
 	}
+	if analysis.TotalPeakLiveAllocations != 1 || analysis.TotalPeakLiveBytes != 64 {
+		t.Fatalf("unexpected peak totals: allocations=%d bytes=%d", analysis.TotalPeakLiveAllocations, analysis.TotalPeakLiveBytes)
+	}
+	if analysis.TotalEverAllocations != 1 || analysis.TotalEverBytes != 64 {
+		t.Fatalf("unexpected ever totals: allocations=%d bytes=%d", analysis.TotalEverAllocations, analysis.TotalEverBytes)
+	}
 }
 
 func TestMemforgeMemoryTimelineAnalyzeArenaGrowSegments(t *testing.T) {
@@ -120,6 +126,65 @@ func TestMemforgeMemoryTimelineAnalyzeArenaGrowSegments(t *testing.T) {
 	}
 	if arena.CapacitySegments[1].DataCapBytes != 4096 || arena.CapacitySegments[1].GrownFromBytes != 1024 {
 		t.Fatalf("unexpected second segment: %+v", arena.CapacitySegments[1])
+	}
+}
+
+func TestMemforgeMemoryTimelineAnalyzeAggregatePeakEverTotals(t *testing.T) {
+	now := time.Now()
+	snapshot := MemforgeMemoryTimelineSnapshot{
+		Available:  true,
+		CapturedAt: now.Add(2 * time.Second),
+		Events: []MemforgeTimelineEvent{
+			{
+				Seq:              1,
+				Timestamp:        now,
+				Kind:             MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress: 0x1000,
+				AllocatorName:    "arena-a",
+			},
+			{
+				Seq:              2,
+				Timestamp:        now,
+				Kind:             MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress: 0x2000,
+				AllocatorName:    "arena-b",
+			},
+			{
+				Seq:               3,
+				Timestamp:         now.Add(time.Millisecond),
+				Kind:              MemforgeTimelineEventAllocation,
+				AllocatorAddress:  0x1000,
+				AllocatorName:     "arena-a",
+				AllocationAddress: 0x3000,
+				SizeBytes:         64,
+			},
+			{
+				Seq:               4,
+				Timestamp:         now.Add(2 * time.Millisecond),
+				Kind:              MemforgeTimelineEventAllocation,
+				AllocatorAddress:  0x2000,
+				AllocatorName:     "arena-b",
+				AllocationAddress: 0x4000,
+				SizeBytes:         128,
+			},
+			{
+				Seq:               5,
+				Timestamp:         now.Add(3 * time.Millisecond),
+				Kind:              MemforgeTimelineEventAllocation,
+				AllocatorAddress:  0x1000,
+				AllocatorName:     "arena-a",
+				AllocationAddress: 0x5000,
+				SizeBytes:         32,
+			},
+		},
+	}
+
+	analysis := MemforgeMemoryTimelineAnalyze(snapshot, MemforgeStackFilter{})
+	if analysis.TotalPeakLiveAllocations != 3 || analysis.TotalPeakLiveBytes != 224 {
+		t.Fatalf("unexpected peak totals: allocations=%d bytes=%d", analysis.TotalPeakLiveAllocations, analysis.TotalPeakLiveBytes)
+	}
+	if analysis.TotalEverAllocations != 3 || analysis.TotalEverBytes != 224 {
+		t.Fatalf("unexpected ever totals: allocations=%d bytes=%d", analysis.TotalEverAllocations, analysis.TotalEverBytes)
 	}
 }
 
