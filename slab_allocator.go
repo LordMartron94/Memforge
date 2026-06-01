@@ -150,8 +150,9 @@ func SlabAllocatorMallocUnsafe[T any](allocator memcore.MarkRaw) memcore.MarkRaw
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
 	idx := memstruct.StackPopUnsafe[uint64](header.freeStack)
 
-	offset := memcore.SizeOf[FixedSlabAllocator[T]]() + idx*header.slotSize
-	ptr := memcore.MemcoreMarkOffsetFrom(allocator, uintptr(offset))
+	alignedIdx := slabAllocatorDataIdxGet(header, idx)
+	ptr := memcore.MemcoreMarkOffsetFrom(allocator, uintptr(alignedIdx))
+	memforgeAllocationAdd(allocator, ptr, header.slotSize)
 	return ptr
 }
 
@@ -162,6 +163,48 @@ func SlabAllocatorCallocUnsafe[T any](allocator memcore.MarkRaw) memcore.MarkRaw
 	ptr := SlabAllocatorMallocUnsafe[T](allocator)
 	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(memcore.SizeOf[T]()))
 	return ptr
+}
+
+/*
+SlabAllocatorFree returns a slot back to the allocator.
+
+It does NOT free memory, so using Malloc on a previously returned slot can cause garbage.
+*/
+func SlabAllocatorFree[T any](allocator memcore.MarkRaw, slot memcore.MarkRaw) {
+	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
+	slotPtr := memcore.MemcoreMarkDereferenceObjectUnsafe[T](slot)
+	baseOffset, dataOffset, slotDataIdx := slabAllocatorItemIdxGet(header, slotPtr)
+
+	if baseOffset < uint64(header.dataBaseOffset) {
+		panic(fmt.Errorf("invalid pointer which does not belong to our data"))
+	}
+
+	if dataOffset%header.slotSize != 0 {
+		panic(fmt.Errorf("misaligned pointer given (not aligned)"))
+	}
+
+	if slotDataIdx < header.slotCapacity {
+		panic(fmt.Errorf("invalid slot idx which is outside of capacity"))
+	}
+
+	memstruct.StackPushUnsafe(header.freeStack, slotDataIdx)
+	memforgeAllocationRemove(allocator, slot)
+}
+
+/*
+SlabAllocatorFreeUnsafe returns a slot back to the allocator.
+
+It does NOT free memory, so using Malloc on a previously returned slot can cause garbage.
+
+This variant does NOT do bounds checks.
+*/
+func SlabAllocatorFreeUnsafe[T any](allocator memcore.MarkRaw, slot memcore.MarkRaw) {
+	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
+	slotPtr := memcore.MemcoreMarkDereferenceObjectUnsafe[T](slot)
+	_, _, slotDataIdx := slabAllocatorItemIdxGet(header, slotPtr)
+
+	memstruct.StackPushUnsafe(header.freeStack, slotDataIdx)
+	memforgeAllocationRemove(allocator, slot)
 }
 
 // Convenience wrappers (typed access)
@@ -188,6 +231,15 @@ func SlabAllocatorCallocObjectUnsafe[T any](allocator memcore.MarkRaw) *T {
 }
 
 // -------------------------------------------- PRIVATE HELPERS
+
+func slabAllocatorItemIdxGet[T any](header *FixedSlabAllocator[T], item *T) (baseOffset, dataOffset, idx uint64) {
+	headerAddr := uintptr(unsafe.Pointer(header))
+	itemAddr := uintptr(unsafe.Pointer(item))
+
+	itemAddrOffset := itemAddr - headerAddr
+	itemAddrDataOffset := itemAddrOffset - header.dataBaseOffset
+	return uint64(itemAddrOffset), uint64(itemAddrDataOffset), uint64(itemAddrDataOffset) / header.slotSize
+}
 
 //go:inline
 func slabAllocatorDataIdxGet[T any](header *FixedSlabAllocator[T], idx uint64) uint64 {
