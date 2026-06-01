@@ -50,7 +50,7 @@ A memcore.MarkRaw to the slab header.
 Panics if capacity is zero or mmap fails.
 
 [See Also]
-SlabAllocatorCreateWithSlotSize when slot bytes come from memarch.LayoutBuilder.
+SlabAllocatorCreateWithSlotSize when slot bytes come from memarch.LayoutBlueprint.
 */
 func SlabAllocatorCreate[T any](capacity uint64) memcore.MarkRaw {
 	return slabAllocatorCreate[T](capacity, memcore.SizeOf[T](), memcore.AlignOf[T]())
@@ -61,7 +61,7 @@ SlabAllocatorCreateWithSlotSize maps a region and initializes a slab with explic
 
 [Context]
 Use when each slot must hold a layout-planned block larger than SizeOf[T], for example the span
-returned by MemArchLayoutBuilderRequiredBytesGet paired with MemArchLayoutBuilderRequiredAlignmentGet.
+returned by MemArchLayoutBlueprintRequiredBytesGet paired with MemArchLayoutBlueprintRequiredAlignmentGet.
 T remains the generic handle for the allocator API; bind slots with marks or pointers only if they
 fit within the declared slot size.
 
@@ -267,8 +267,8 @@ func SlabAllocatorFree[T any](allocator memcore.MarkRaw, slot memcore.MarkRaw) {
 		panic(fmt.Errorf("misaligned pointer given (not aligned)"))
 	}
 
-	if slotDataIdx < header.slotCapacity {
-		panic(fmt.Errorf("invalid slot idx which is outside of capacity"))
+	if slotDataIdx > header.slotCapacity-1 {
+		panic(fmt.Errorf("invalid slot idx (%d) which is outside of capacity (%d)", slotDataIdx, header.slotCapacity))
 	}
 
 	memstruct.StackPushUnsafe(header.freeStack, slotDataIdx)
