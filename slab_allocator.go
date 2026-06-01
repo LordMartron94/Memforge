@@ -38,7 +38,7 @@ type FixedSlabAllocator[T any] struct {
 }
 
 /*
-SlabAllocatorCreate maps a region and initializes a slab pool for T.
+SlabAllocatorCreate maps a region and initializes a slab pool sized from SizeOf and AlignOf T.
 
 [Parameters]
 capacity - Number of slots; must be greater than zero.
@@ -48,15 +48,48 @@ A memcore.MarkRaw to the slab header.
 
 [Errors]
 Panics if capacity is zero or mmap fails.
+
+[See Also]
+SlabAllocatorCreateWithSlotSize when slot bytes come from memarch.LayoutBuilder.
 */
 func SlabAllocatorCreate[T any](capacity uint64) memcore.MarkRaw {
-	if capacity == 0 {
-		panic("cannot create slab allocator with capacity 0")
-	}
+	return slabAllocatorCreate[T](capacity, memcore.SizeOf[T](), memcore.AlignOf[T]())
+}
 
-	objSize := memcore.SizeOf[T]()
-	objAlign := memcore.AlignOf[T]()
-	slotSize := alignIdxUp(objSize, objAlign)
+/*
+SlabAllocatorCreateWithSlotSize maps a region and initializes a slab with explicit slot geometry.
+
+[Context]
+Use when each slot must hold a layout-planned block larger than SizeOf[T], for example the span
+returned by MemArchLayoutBuilderRequiredBytesGet paired with MemArchLayoutBuilderRequiredAlignmentGet.
+T remains the generic handle for the allocator API; bind slots with marks or pointers only if they
+fit within the declared slot size.
+
+[Parameters]
+capacity - Number of slots; must be greater than zero.
+slotSizeBytes - Minimum payload bytes per slot before alignment rounding.
+slotAlignment - Required slot alignment; must be a power of two greater than zero.
+
+[Returns]
+A memcore.MarkRaw to the slab header.
+
+[Errors]
+Panics if capacity or slotSizeBytes is zero, alignment is invalid, or mmap fails.
+*/
+func SlabAllocatorCreateWithSlotSize[T any](capacity, slotSizeBytes, slotAlignment uint64) memcore.MarkRaw {
+	return slabAllocatorCreate[T](capacity, slotSizeBytes, slotAlignment)
+}
+
+func slabAllocatorCreate[T any](capacity, slotSizeBytes, slotAlignment uint64) memcore.MarkRaw {
+	if capacity == 0 {
+		panic("slab allocator: capacity must be greater than zero")
+	}
+	if slotSizeBytes == 0 {
+		panic("slab allocator: slot size must be greater than zero")
+	}
+	alignmentValidate(slotAlignment)
+
+	slotSize := alignIdxUp(slotSizeBytes, slotAlignment)
 	headerSize := memcore.SizeOf[FixedSlabAllocator[T]]()
 	headerAlignedSize := alignIdxUp(uint64(headerSize), uint64(allocatorDataAddrAlignment))
 	totalBytes := headerAlignedSize + slotSize*capacity
@@ -76,24 +109,19 @@ func SlabAllocatorCreate[T any](capacity uint64) memcore.MarkRaw {
 	stackAlign := memstruct.StackRequiredAlignmentGet[uint64]()
 
 	metaAlloc := FixedLinearAllocatorCreate(stackBytes)
-	header.metaAllocator = metaAlloc
-
 	stackPtr := FixedLinearAllocatorMalloc(metaAlloc, stackBytes, stackAlign)
 	memstruct.StackInitializeAt[uint64](stackPtr, capacity)
-	header.freeStack = stackPtr
-
 	for i := capacity; i > 0; i-- {
 		memstruct.StackPushUnsafe(stackPtr, i-1)
 	}
 
-	// --- Write header
 	*header = FixedSlabAllocator[T]{
 		allocatorAddr:      allocatorAddr,
 		dataBaseOffset:     uintptr(headerAlignedSize),
 		regionID:           regionID,
 		allocatorTotalSize: totalBytes,
 		slotSize:           slotSize,
-		slotAlignment:      memcore.AlignOf[uint64](),
+		slotAlignment:      slotAlignment,
 		slotCapacity:       capacity,
 		freeStack:          stackPtr,
 		metaAllocator:      metaAlloc,
@@ -201,12 +229,13 @@ func SlabAllocatorMallocUnsafe[T any](allocator memcore.MarkRaw) memcore.MarkRaw
 }
 
 /*
-SlabAllocatorCallocUnsafe allocates via MallocUnsafe and zeroes SizeOf[T] bytes (not the full slot padding).
+SlabAllocatorCallocUnsafe allocates via MallocUnsafe and zeroes the full slot byte span.
 */
 //go:nosplit
 func SlabAllocatorCallocUnsafe[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
+	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
 	ptr := SlabAllocatorMallocUnsafe[T](allocator)
-	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(memcore.SizeOf[T]()))
+	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(header.slotSize))
 	return ptr
 }
 
@@ -262,10 +291,22 @@ func SlabAllocatorFreeUnsafe[T any](allocator memcore.MarkRaw, slot memcore.Mark
 }
 
 /*
+SlabAllocatorSlotSizeGet returns the aligned byte size of each slot.
+
+[Context]
+Matches the value used when the allocator was created, including alignment rounding from
+SlabAllocatorCreateWithSlotSize.
+*/
+func SlabAllocatorSlotSizeGet[T any](allocator memcore.MarkRaw) uint64 {
+	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
+	return header.slotSize
+}
+
+/*
 SlabAllocatorMallocObject returns a *T view of a new slab slot (uninitialized).
 
 [Side Effects]
-Convenience wrapper only; does not store Go pointers in manual memory.
+Convenience wrapper only; does not store Go pointers in manual memory. Unsafe when slot size exceeds sizeof(T).
 */
 func SlabAllocatorMallocObject[T any](allocator memcore.MarkRaw) *T {
 	ptr := SlabAllocatorMalloc[T](allocator)

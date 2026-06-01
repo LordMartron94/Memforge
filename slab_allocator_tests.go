@@ -25,6 +25,8 @@ func TestFixedSlabAllocator(t *testing.T) {
 	t.Run("allocation_exhaustion_panics", testSlabAllocationExhaustionPanics)
 	t.Run("reset_allows_full_reuse", testSlabResetAllowsFullReuse)
 	t.Run("unsafe_functions_work_as_expected", testSlabUnsafeFunctionsWork)
+	t.Run("create_with_custom_slot_size", testSlabCreateWithCustomSlotSize)
+	t.Run("create_with_zero_slot_size_panics", testSlabCreateWithZeroSlotSizePanics)
 }
 
 // ---------------- Test Cases ----------------
@@ -46,6 +48,44 @@ func testSlabCreateWithZeroCapacityPanics(t *testing.T) {
 	mustPanic(t, func() {
 		SlabAllocatorCreate[testSlabStruct](0)
 	})
+}
+
+func testSlabCreateWithZeroSlotSizePanics(t *testing.T) {
+	mustPanic(t, func() {
+		SlabAllocatorCreateWithSlotSize[testSlabStruct](8, 0, memcore.AlignOf[testSlabStruct]())
+	})
+}
+
+func testSlabCreateWithCustomSlotSize(t *testing.T) {
+	const customSlotBytes uint64 = 256
+	align := memcore.AlignOf[testSlabStruct]()
+
+	a := SlabAllocatorCreateWithSlotSize[testSlabStruct](4, customSlotBytes, align)
+	defer SlabAllocatorDestroy[testSlabStruct](a)
+
+	if got := SlabAllocatorSlotSizeGet[testSlabStruct](a); got < customSlotBytes {
+		t.Fatalf("slot size %d smaller than requested %d", got, customSlotBytes)
+	}
+
+	m1 := SlabAllocatorMalloc[testSlabStruct](a)
+	m2 := SlabAllocatorMalloc[testSlabStruct](a)
+
+	off1 := memcore.MemcoreMarkSubtractBaseOffset(m1, uintptr(memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[testSlabStruct]](a).dataBaseOffset))
+	off2 := memcore.MemcoreMarkSubtractBaseOffset(m2, uintptr(memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[testSlabStruct]](a).dataBaseOffset))
+	slotSize := SlabAllocatorSlotSizeGet[testSlabStruct](a)
+	if uint64(off2-off1) != slotSize {
+		t.Fatalf("slot spacing %d, want %d", off2-off1, slotSize)
+	}
+
+	// Write distinct patterns in the full custom slot without overlapping.
+	p1 := memcore.MemcoreMarkDereference(m1)
+	p2 := memcore.MemcoreMarkDereference(m2)
+	memcore.MemoryClearNoHeapPointers(p1, uintptr(slotSize))
+	*(*byte)(p1) = 0xAA
+	*(*byte)(unsafe.Pointer(uintptr(p2) + uintptr(slotSize) - 1)) = 0xBB
+	if *(*byte)(p2) == 0xAA {
+		t.Fatal("adjacent custom slots overlap")
+	}
 }
 
 func testSlabMallocAndCallocObjects(t *testing.T) {
