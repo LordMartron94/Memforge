@@ -232,15 +232,58 @@ func TestMemforgeMemoryTimelineAnalyzeDeterministicArenaOrder(t *testing.T) {
 		t.Fatalf("expected 3 arenas, got %d", len(analysis.Arenas))
 	}
 
-	// The semantic order should prioritize creator stack, then creation time, then address.
-	if analysis.Arenas[0].Address != 0x1000 {
+	if analysis.Arenas[0].Address != 0x3000 {
 		t.Fatalf("unexpected arena[0] order: %#x", analysis.Arenas[0].Address)
 	}
-	if analysis.Arenas[1].Address != 0x2000 {
+	if analysis.Arenas[1].Address != 0x1000 {
 		t.Fatalf("unexpected arena[1] order: %#x", analysis.Arenas[1].Address)
 	}
-	if analysis.Arenas[2].Address != 0x3000 {
+	if analysis.Arenas[2].Address != 0x2000 {
 		t.Fatalf("unexpected arena[2] order: %#x", analysis.Arenas[2].Address)
+	}
+}
+
+func TestMemforgeMemoryTimelineAnalyzeUtilizationMetrics(t *testing.T) {
+	now := time.Now()
+	snapshot := MemforgeMemoryTimelineSnapshot{
+		Available:  true,
+		CapturedAt: now.Add(time.Second),
+		Events: []MemforgeTimelineEvent{
+			{
+				Seq:               1,
+				Timestamp:         now,
+				Kind:              MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress:  0x1000,
+				AllocatorName:     "arena-a",
+				ArenaDataCapBytes: 1000,
+				ArenaTotalBytes:   1100,
+			},
+			{
+				Seq:               2,
+				Timestamp:         now.Add(time.Millisecond),
+				Kind:              MemforgeTimelineEventAllocation,
+				AllocatorAddress:  0x1000,
+				AllocatorName:     "arena-a",
+				AllocationAddress: 0x2000,
+				SizeBytes:         250,
+			},
+		},
+	}
+
+	analysis := MemforgeMemoryTimelineAnalyze(snapshot, MemforgeStackFilter{})
+	if analysis.LiveUtilizationPercent != 25 || analysis.EverUtilizationPercent != 25 {
+		t.Fatalf("unexpected global utilization: live=%.1f ever=%.1f", analysis.LiveUtilizationPercent, analysis.EverUtilizationPercent)
+	}
+	if len(analysis.Arenas) != 1 {
+		t.Fatalf("expected one arena, got %d", len(analysis.Arenas))
+	}
+	arena := analysis.Arenas[0]
+	if arena.LiveUtilizationPercent != 25 || arena.EverUtilizationPercent != 25 || arena.PeakUtilizationPercent != 25 {
+		t.Fatalf("unexpected arena utilization: live=%.1f peak=%.1f ever=%.1f",
+			arena.LiveUtilizationPercent, arena.PeakUtilizationPercent, arena.EverUtilizationPercent)
+	}
+	if arena.LastAllocationAt.IsZero() {
+		t.Fatalf("expected last allocation timestamp")
 	}
 }
 

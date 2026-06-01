@@ -80,7 +80,7 @@ type allocation struct {
 }
 
 // memforgeCaptureCallStack returns a formatted call stack string for debugging.
-// It skips internal frames and formats each frame as "Func → Func → Func".
+// It skips internal frames and formats each frame as "Func (file.go:line)" joined by " → ".
 func memforgeCaptureCallStack(skip int) string {
 	const maxDepth = 16
 	var pcs [maxDepth]uintptr
@@ -91,7 +91,7 @@ func memforgeCaptureCallStack(skip int) string {
 	for {
 		f, more := frames.Next()
 		if !isInternalFrame(f.Function) {
-			stack = append(stack, filepath.Base(f.Function))
+			stack = append(stack, memforgeFormatStackFrame(f))
 		}
 		if !more {
 			break
@@ -99,6 +99,14 @@ func memforgeCaptureCallStack(skip int) string {
 	}
 	slices.Reverse(stack)
 	return strings.Join(stack, " → ")
+}
+
+func memforgeFormatStackFrame(frame runtime.Frame) string {
+	fn := filepath.Base(frame.Function)
+	if frame.File == "" || frame.Line <= 0 {
+		return fn
+	}
+	return fmt.Sprintf("%s (%s:%d)", fn, filepath.Base(frame.File), frame.Line)
 }
 
 func isInternalFrame(fn string) bool {
@@ -564,7 +572,7 @@ func memforgeMemoryAnalysisDebugPrint(analysis MemforgeMemoryTimelineAnalysis, p
 	}
 
 	memforgeMemoryAnalysisSummaryDebugPrint(analysis, opts.showEventKindLines)
-	memforgeArenaSummaryDebugPrint(analysis.Arenas)
+	memforgeArenaSummaryDebugPrint(analysis.Arenas, analysis.CapturedAt)
 
 	if analysis.TotalLiveAllocations > 0 {
 		fmt.Printf("%s\nLeak Groups (by filtered stack):%s\n", colorBoldYellow, colorReset)
@@ -608,6 +616,18 @@ func memforgeMemoryAnalysisSummaryDebugPrint(analysis MemforgeMemoryTimelineAnal
 		colorWhite, colorReset,
 		analysis.TotalEverAllocations,
 		humanBytes(float64(analysis.TotalEverBytes)))
+	if analysis.TotalArenaDataCapBytes > 0 {
+		fmt.Printf("%sArena cap :%s %s", colorWhite, colorReset, humanBytes(float64(analysis.TotalArenaDataCapBytes)))
+		if analysis.TotalArenaMmapBytes > 0 {
+			fmt.Printf("  %sMmap:%s %s", colorWhite, colorReset, humanBytes(float64(analysis.TotalArenaMmapBytes)))
+		}
+		fmt.Println()
+		fmt.Printf("%sUtil      :%s live %.1f%%  peak %.1f%%  ever %.1f%%\n",
+			colorWhite, colorReset,
+			analysis.LiveUtilizationPercent,
+			analysis.PeakUtilizationPercent,
+			analysis.EverUtilizationPercent)
+	}
 
 	if showEventKinds && analysis.TotalEvents > 0 {
 		memforgeMemoryAnalysisEventKindsDebugPrint(analysis.Events)
@@ -653,7 +673,7 @@ func memforgeMemoryAnalysisEventKindsDebugPrint(events []MemforgeTimelineEvent) 
 	}
 }
 
-func memforgeArenaSummaryDebugPrint(arenas []MemforgeArenaSummary) {
+func memforgeArenaSummaryDebugPrint(arenas []MemforgeArenaSummary, capturedAt time.Time) {
 	fmt.Printf("%s\nArena Summary:%s\n", colorBoldYellow, colorReset)
 	for _, arena := range arenas {
 		leakColor := colorGreen
@@ -663,16 +683,41 @@ func memforgeArenaSummaryDebugPrint(arenas []MemforgeArenaSummary) {
 			leakLabel = "LEAKING"
 		}
 		fmt.Printf("  %s%s%s %s (%s)\n", leakColor, leakLabel, colorReset, arena.Name, formatTimelineAddress(arena.Address))
+		fmt.Printf("    created=%s\n", memforgeFormatDebugTimestamp(arena.CreatedAt, capturedAt))
+		fmt.Printf("    last alloc=%s\n", memforgeFormatDebugTimestamp(arena.LastAllocationAt, capturedAt))
 		fmt.Printf("    age=%s live=%d/%s peak=%d/%s ever=%d/%s\n",
 			formatDuration(arena.AgeAtCapture),
 			arena.LiveAllocations, humanBytes(float64(arena.LiveBytes)),
 			arena.PeakLiveAllocations, humanBytes(float64(arena.PeakLiveBytes)),
 			arena.EverAllocations, humanBytes(float64(arena.EverBytes)))
 		memforgeArenaCapacityDebugPrint(arena)
+		memforgeArenaUtilizationDebugPrint(arena)
 		if len(arena.FilteredCreatorStack) > 0 {
 			fmt.Printf("    created by: %s%s%s\n", colorCyan, strings.Join(arena.FilteredCreatorStack, " → "), colorReset)
 		}
 	}
+}
+
+func memforgeFormatDebugTimestamp(at time.Time, capturedAt time.Time) string {
+	if at.IsZero() {
+		return "never"
+	}
+	label := at.Format("15:04:05.000")
+	if capturedAt.IsZero() || capturedAt.Before(at) {
+		return label
+	}
+	return fmt.Sprintf("%s (%s ago)", label, formatDuration(capturedAt.Sub(at)))
+}
+
+func memforgeArenaUtilizationDebugPrint(arena MemforgeArenaSummary) {
+	if arena.CurrentArenaDataCapBytes == 0 {
+		return
+	}
+	fmt.Printf("    %sUtil:%s live %.1f%%  peak %.1f%%  ever %.1f%%\n",
+		colorWhite, colorReset,
+		arena.LiveUtilizationPercent,
+		arena.PeakUtilizationPercent,
+		arena.EverUtilizationPercent)
 }
 
 func memforgeArenaCapacityDebugPrint(arena MemforgeArenaSummary) {
@@ -691,10 +736,6 @@ func memforgeArenaCapacityDebugPrint(arena MemforgeArenaSummary) {
 	}
 	if peakCap > arena.CurrentArenaDataCapBytes {
 		line += fmt.Sprintf("  %sPeak arena:%s %s", colorWhite, colorReset, humanBytes(float64(peakCap)))
-	}
-	if arena.CurrentArenaDataCapBytes > 0 && arena.LiveBytes > 0 {
-		utilPct := float64(arena.LiveBytes) * 100 / float64(arena.CurrentArenaDataCapBytes)
-		line += fmt.Sprintf("  %sLive util:%s %.1f%%", colorWhite, colorReset, utilPct)
 	}
 	fmt.Println(line)
 

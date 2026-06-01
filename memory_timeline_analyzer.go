@@ -42,6 +42,9 @@ type MemforgeArenaSummary struct {
 	CurrentArenaTotalBytes   uint64
 	PeakArenaDataCapBytes    uint64
 	CapacitySegments         []MemforgeArenaCapacitySegment
+	LiveUtilizationPercent   float64
+	PeakUtilizationPercent   float64
+	EverUtilizationPercent   float64
 }
 
 /*
@@ -78,6 +81,11 @@ type MemforgeMemoryTimelineAnalysis struct {
 	TotalPeakLiveBytes       uint64
 	TotalEverAllocations     int
 	TotalEverBytes           uint64
+	TotalArenaDataCapBytes   uint64
+	TotalArenaMmapBytes      uint64
+	LiveUtilizationPercent   float64
+	PeakUtilizationPercent   float64
+	EverUtilizationPercent   float64
 	LeakDetected             bool
 }
 
@@ -242,6 +250,7 @@ func MemforgeMemoryTimelineAnalyze(snapshot MemforgeMemoryTimelineSnapshot, filt
 	for _, arena := range arenas {
 		arena.summary.AgeAtCapture = analysis.CapturedAt.Sub(arena.summary.CreatedAt)
 		arena.summary.Leaking = !arena.summary.Destroyed && arena.summary.LiveAllocations > 0
+		memforgeArenaSummaryComputeUtilization(&arena.summary)
 		analysis.Arenas = append(analysis.Arenas, arena.summary)
 	}
 	slices.SortFunc(analysis.Arenas, compareArenaSummaries)
@@ -301,6 +310,7 @@ func MemforgeMemoryTimelineAnalyze(snapshot MemforgeMemoryTimelineSnapshot, filt
 		analysis.TotalEverAllocations += arena.EverAllocations
 		analysis.TotalEverBytes += arena.EverBytes
 	}
+	memforgeMemoryTimelineAnalysisComputeUtilization(&analysis)
 	analysis.LeakDetected = analysis.TotalLiveAllocations > 0
 	return analysis
 }
@@ -381,67 +391,58 @@ func memforgeArenaCapacityCloseOpenSegment(summary *MemforgeArenaSummary, endedA
 	}
 }
 
-func compareArenaSummaries(a, b MemforgeArenaSummary) int {
-	if a.Leaking != b.Leaking {
-		if a.Leaking {
-			return -1
-		}
-		return 1
+func memforgeArenaSummaryComputeUtilization(summary *MemforgeArenaSummary) {
+	if summary.CurrentArenaDataCapBytes == 0 {
+		return
 	}
-	stackCmp := compareStringSlicesLex(a.FilteredCreatorStack, b.FilteredCreatorStack)
+
+	summary.LiveUtilizationPercent = float64(summary.LiveBytes) * 100 / float64(summary.CurrentArenaDataCapBytes)
+	summary.EverUtilizationPercent = float64(summary.EverBytes) * 100 / float64(summary.CurrentArenaDataCapBytes)
+
+	peakCap := summary.PeakArenaDataCapBytes
+	if peakCap == 0 {
+		peakCap = summary.CurrentArenaDataCapBytes
+	}
+	if peakCap > 0 {
+		summary.PeakUtilizationPercent = float64(summary.PeakLiveBytes) * 100 / float64(peakCap)
+	}
+}
+
+func memforgeMemoryTimelineAnalysisComputeUtilization(analysis *MemforgeMemoryTimelineAnalysis) {
+	var totalPeakCap uint64
+	for _, arena := range analysis.Arenas {
+		if arena.CurrentArenaDataCapBytes > 0 {
+			analysis.TotalArenaDataCapBytes += arena.CurrentArenaDataCapBytes
+		}
+		if arena.CurrentArenaTotalBytes > 0 {
+			analysis.TotalArenaMmapBytes += arena.CurrentArenaTotalBytes
+		}
+
+		peakCap := arena.PeakArenaDataCapBytes
+		if peakCap == 0 {
+			peakCap = arena.CurrentArenaDataCapBytes
+		}
+		totalPeakCap += peakCap
+	}
+
+	if analysis.TotalArenaDataCapBytes > 0 {
+		analysis.LiveUtilizationPercent = float64(analysis.TotalLiveBytes) * 100 / float64(analysis.TotalArenaDataCapBytes)
+		analysis.EverUtilizationPercent = float64(analysis.TotalEverBytes) * 100 / float64(analysis.TotalArenaDataCapBytes)
+	}
+	if totalPeakCap > 0 {
+		analysis.PeakUtilizationPercent = float64(analysis.TotalPeakLiveBytes) * 100 / float64(totalPeakCap)
+	}
+}
+
+func compareArenaSummaries(a, b MemforgeArenaSummary) int {
 	switch {
-	case a.LiveBytes > b.LiveBytes:
-		return -1
-	case a.LiveBytes < b.LiveBytes:
-		return 1
-	case a.LiveAllocations > b.LiveAllocations:
-		return -1
-	case a.LiveAllocations < b.LiveAllocations:
-		return 1
-	case a.Name < b.Name:
-		return -1
-	case a.Name > b.Name:
-		return 1
-	case stackCmp < 0:
-		return -1
-	case stackCmp > 0:
-		return 1
 	case a.CreatedAt.Before(b.CreatedAt):
 		return -1
 	case a.CreatedAt.After(b.CreatedAt):
 		return 1
-	case a.LastAllocationAt.Before(b.LastAllocationAt):
-		return -1
-	case a.LastAllocationAt.After(b.LastAllocationAt):
-		return 1
 	case a.Address < b.Address:
 		return -1
 	case a.Address > b.Address:
-		return 1
-	default:
-		return 0
-	}
-}
-
-func compareStringSlicesLex(a, b []string) int {
-	minLen := len(a)
-	if len(b) < minLen {
-		minLen = len(b)
-	}
-
-	for i := 0; i < minLen; i++ {
-		switch {
-		case a[i] < b[i]:
-			return -1
-		case a[i] > b[i]:
-			return 1
-		}
-	}
-
-	switch {
-	case len(a) < len(b):
-		return -1
-	case len(a) > len(b):
 		return 1
 	default:
 		return 0
