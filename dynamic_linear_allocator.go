@@ -6,12 +6,39 @@ import (
 	"unsafe"
 )
 
-// GrowthStrategy determines how the dynamic allocator expands.
-// currentCap = current capacity, neededCap = new required capacity.
+/*
+GrowthStrategy computes the new arena capacity when a dynamic linear allocator grows.
+
+[Parameters]
+currentCap - Arena data capacity before growth.
+neededCap - Minimum capacity required to satisfy the pending allocation.
+
+[Returns]
+The new data capacity in bytes; must be greater than or equal to neededCap or growth panics.
+*/
 type GrowthStrategy func(currentCap, neededCap uint64) uint64
 
-// DynamicLinearAllocator is a dynamic bump allocator with namespace isolation.
-// It owns its own namespace and can grow via Mremap.
+/*
+DynamicLinearAllocator is a growable bump allocator in a single mmap region.
+
+[Context]
+Like FixedLinearAllocator but expands the mapped region via mremap when the bump arena is full.
+Register a GrowthStrategy at creation (by function ID or DynamicLinearAllocatorCreateFunction).
+
+[Complexity]
+Malloc: O(1) amortized; occasional growth is O(n) over moved bytes.
+Reset: O(1).
+
+[Side Effects]
+Growth may relocate the mmap base; raw addresses derived before growth are invalid.
+
+[Thread Safety]
+Not safe for concurrent use from multiple goroutines.
+
+[Invariants]
+Do not store Go pointers in allocator-managed memory. Pointers become invalid after Reset, Destroy,
+or a growth event that moves the region.
+*/
 type DynamicLinearAllocator struct {
 	allocatorAddr  uintptr
 	dataBaseOffset uintptr
@@ -24,10 +51,19 @@ type DynamicLinearAllocator struct {
 	growthStrategyID memcore.FunctionID
 }
 
-// DynamicLinearAllocatorCreate creates a new dynamic allocator in its own mmap region.
-//
-// It allocates both the header and initial arena contiguously and registers a namespace
-// for all pointers allocated within. The returned memcore.MarkRaw refers to the allocator header.
+/*
+DynamicLinearAllocatorCreate maps a region and initializes a dynamic linear allocator.
+
+[Parameters]
+initialCapacityBytes - Initial bump arena capacity excluding the header.
+growthStrategyID - Registered memcore function ID for a GrowthStrategy.
+
+[Returns]
+A memcore.MarkRaw to the allocator header.
+
+[Errors]
+Panics if mmap fails or growthStrategyID does not resolve to a GrowthStrategy.
+*/
 func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategyID memcore.FunctionID) memcore.MarkRaw {
 	headerSize := memcore.SizeOf[DynamicLinearAllocator]()
 	headerAlignedSize := alignIdxUp(headerSize, uint64(allocatorDataAddrAlignment))
@@ -60,11 +96,19 @@ func DynamicLinearAllocatorCreate(initialCapacityBytes uint64, growthStrategyID 
 	return allocatorPtr
 }
 
-// DynamicLinearAllocatorCreateFunction creates a new dynamic allocator in its own mmap region.
-// This variant automatically registers the growth strategy.
-//
-// It allocates both the header and initial arena contiguously and registers a namespace
-// for all pointers allocated within. The returned memcore.MarkRaw refers to the allocator header.
+/*
+DynamicLinearAllocatorCreateFunction is like DynamicLinearAllocatorCreate but registers growthStrategy.
+
+[Parameters]
+initialCapacityBytes - Initial bump arena capacity excluding the header.
+growthStrategy - Called when the arena must grow; must return capacity at least neededCap.
+
+[Returns]
+A memcore.MarkRaw to the allocator header.
+
+[Errors]
+Panics if mmap fails.
+*/
 func DynamicLinearAllocatorCreateFunction(initialCapacityBytes uint64, growthStrategy GrowthStrategy) memcore.MarkRaw {
 	headerSize := memcore.SizeOf[DynamicLinearAllocator]()
 	headerAlignedSize := alignIdxUp(headerSize, uint64(allocatorDataAddrAlignment))
@@ -99,8 +143,12 @@ func DynamicLinearAllocatorCreateFunction(initialCapacityBytes uint64, growthStr
 	return allocatorPtr
 }
 
-// DynamicLinearAllocatorDestroy releases all memory and unregisters all pointers.
-// After this call, the allocator is invalid and may not be reused.
+/*
+DynamicLinearAllocatorDestroy unmaps the region and unregisters all tracked allocations.
+
+[Invariants]
+The allocator must not be used after this call.
+*/
 func DynamicLinearAllocatorDestroy(allocator memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[DynamicLinearAllocator](allocator)
 
@@ -112,9 +160,25 @@ func DynamicLinearAllocatorDestroy(allocator memcore.MarkRaw) {
 	}
 }
 
-// DynamicLinearAllocatorMalloc allocates a block of memory from the dynamic allocator.
-// Returns a memcore.MarkRaw inside the allocator’s namespace.
-//
+/*
+DynamicLinearAllocatorMalloc allocates sizeBytes with alignment, growing the arena if needed.
+
+[Parameters]
+sizeBytes - Requested allocation size in bytes.
+alignment - Required alignment; must be a power of two greater than zero.
+
+[Returns]
+A memcore.MarkRaw to uninitialized memory.
+
+[Errors]
+Panics on invalid alignment, growth failure, growth strategy violation, or mmap remap failure.
+
+[Complexity]
+Time: O(1) amortized per call.
+
+[Side Effects]
+May grow and relocate the underlying mmap; updates memforge telemetry on growth.
+*/
 //go:nosplit
 func DynamicLinearAllocatorMalloc(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	header := memcore.MemcoreMarkDereferenceObject[DynamicLinearAllocator](allocator)
@@ -133,8 +197,12 @@ func DynamicLinearAllocatorMalloc(allocator memcore.MarkRaw, sizeBytes, alignmen
 	return ptr
 }
 
-// DynamicLinearAllocatorMallocUnsafe allocates memory without validation.
-//
+/*
+DynamicLinearAllocatorMallocUnsafe allocates without alignment validation.
+
+[Errors]
+Panics on out-of-memory or growth failures, same as DynamicLinearAllocatorMalloc.
+*/
 //go:nosplit
 func DynamicLinearAllocatorMallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	header := memcore.MemcoreMarkDereferenceObject[DynamicLinearAllocator](allocator)
@@ -152,8 +220,9 @@ func DynamicLinearAllocatorMallocUnsafe(allocator memcore.MarkRaw, sizeBytes, al
 	return ptr
 }
 
-// DynamicLinearAllocatorCalloc allocates and zeroes memory.
-//
+/*
+DynamicLinearAllocatorCalloc allocates with alignment and zeroes the region.
+*/
 //go:nosplit
 func DynamicLinearAllocatorCalloc(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	ptr := DynamicLinearAllocatorMalloc(allocator, sizeBytes, alignment)
@@ -161,8 +230,9 @@ func DynamicLinearAllocatorCalloc(allocator memcore.MarkRaw, sizeBytes, alignmen
 	return ptr
 }
 
-// DynamicLinearAllocatorCallocUnsafe allocates and zeroes memory without validation.
-//
+/*
+DynamicLinearAllocatorCallocUnsafe allocates and zeroes memory without alignment validation.
+*/
 //go:nosplit
 func DynamicLinearAllocatorCallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	ptr := DynamicLinearAllocatorMallocUnsafe(allocator, sizeBytes, alignment)
@@ -170,8 +240,12 @@ func DynamicLinearAllocatorCallocUnsafe(allocator memcore.MarkRaw, sizeBytes, al
 	return ptr
 }
 
-// DynamicLinearAllocatorMallocObject allocates a typed object.
-// It also returns the allocation interpreted as *T which is not safe to store inside manually allocated memory.
+/*
+DynamicLinearAllocatorMallocObject allocates storage for T using SizeOf and AlignOf.
+
+[Returns]
+A memcore.MarkRaw and a *T view. The *T must not be stored inside manually allocated memory.
+*/
 func DynamicLinearAllocatorMallocObject[T any](allocator memcore.MarkRaw) (memcore.MarkRaw, *T) {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
@@ -179,8 +253,12 @@ func DynamicLinearAllocatorMallocObject[T any](allocator memcore.MarkRaw) (memco
 	return ptr, memcore.MemcoreMarkDereferenceObject[T](ptr)
 }
 
-// DynamicLinearAllocatorCallocObject allocates a zeroed typed object.
-// It also returns the allocation interpreted as *T which is not safe to store inside manually allocated memory.
+/*
+DynamicLinearAllocatorCallocObject allocates a zeroed value of T.
+
+[Returns]
+A memcore.MarkRaw and a *T view. The *T must not be stored inside manually allocated memory.
+*/
 func DynamicLinearAllocatorCallocObject[T any](allocator memcore.MarkRaw) (memcore.MarkRaw, *T) {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
@@ -188,9 +266,18 @@ func DynamicLinearAllocatorCallocObject[T any](allocator memcore.MarkRaw) (memco
 	return ptr, memcore.MemcoreMarkDereferenceObject[T](ptr)
 }
 
-// DynamicLinearAllocatorReset resets the allocator, allowing reuse.
-// All pointers within the namespace are unregistered.
-// Using them afterward is undefined behaviour.
+/*
+DynamicLinearAllocatorReset sets the bump index to zero without shrinking the mapped capacity.
+
+[Complexity]
+Time: O(1).
+
+[Side Effects]
+Clears memforge allocation tracking. Does not zero memory or unmap excess capacity.
+
+[Invariants]
+All prior allocation marks are invalid after Reset.
+*/
 func DynamicLinearAllocatorReset(allocator memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[DynamicLinearAllocator](allocator)
 	memforgeAllocatorRemoveAll(allocator)
@@ -199,6 +286,9 @@ func DynamicLinearAllocatorReset(allocator memcore.MarkRaw) {
 
 // -------------------------- PRIVATE HELPERS --------------------------
 
+/*
+GrowthStrategyViolation is returned when a GrowthStrategy proposes capacity below neededCap.
+*/
 type GrowthStrategyViolation struct {
 	PrevCapacity uint64
 	Required     uint64

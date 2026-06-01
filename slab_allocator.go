@@ -7,12 +7,24 @@ import (
 	"unsafe"
 )
 
-// FixedSlabAllocator is a pooled allocator for fixed-size objects of type T.
-// All allocations live in a dedicated namespace inside a single mmap region.
-// The allocator itself (the header) must stay on the Go heap.
-//
-// ⚠️ Do NOT store Go pointers inside memory returned by this allocator.
-// ⚠️ Do NOT move the allocator struct itself into manual memory.
+/*
+FixedSlabAllocator is a fixed-capacity pool of uniform slots for type T.
+
+[Context]
+Slots are indexed; a free stack tracks available indices. Malloc pops an index, Free pushes it back.
+The header struct must remain on the Go heap; only slot payload lives in the mmap region.
+
+[Complexity]
+Malloc and Free: O(1).
+Reset: O(n) over slotCapacity to rebuild the free stack.
+
+[Thread Safety]
+Not safe for concurrent use from multiple goroutines.
+
+[Invariants]
+Do not store Go pointers in slot memory. Do not move this header into manual memory. Returned Malloc
+memory is uninitialized unless using Calloc. Marks are invalid after Reset or Destroy.
+*/
 type FixedSlabAllocator[T any] struct {
 	allocatorAddr      uintptr // base address of mmap region
 	dataBaseOffset     uintptr
@@ -25,10 +37,18 @@ type FixedSlabAllocator[T any] struct {
 	metaAllocator      memcore.MarkRaw // points to FixedLinearAllocator
 }
 
-// SlabAllocatorCreate creates a new slab allocator inside its own mmap region.
-//
-// The allocator registers its own namespace. It also creates a metadata allocator
-// (FixedLinearAllocator) that holds the free stack structure.
+/*
+SlabAllocatorCreate maps a region and initializes a slab pool for T.
+
+[Parameters]
+capacity - Number of slots; must be greater than zero.
+
+[Returns]
+A memcore.MarkRaw to the slab header.
+
+[Errors]
+Panics if capacity is zero or mmap fails.
+*/
 func SlabAllocatorCreate[T any](capacity uint64) memcore.MarkRaw {
 	if capacity == 0 {
 		panic("cannot create slab allocator with capacity 0")
@@ -84,9 +104,12 @@ func SlabAllocatorCreate[T any](capacity uint64) memcore.MarkRaw {
 	return headerPtr
 }
 
-// SlabAllocatorDestroy destroys the slab allocator and all registered pointers.
-//
-// Do NOT use the allocator after calling this.
+/*
+SlabAllocatorDestroy destroys the metadata linear allocator, unmaps the slab region, and clears telemetry.
+
+[Invariants]
+The allocator must not be used after this call.
+*/
 func SlabAllocatorDestroy[T any](allocator memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
 
@@ -100,9 +123,15 @@ func SlabAllocatorDestroy[T any](allocator memcore.MarkRaw) {
 	}
 }
 
-// SlabAllocatorReset clears the allocator, restoring all slots to free state.
-//
-// Using previously returned pointers after reset is undefined behaviour.
+/*
+SlabAllocatorReset rebuilds the free stack so every slot is available again.
+
+[Complexity]
+Time: O(n) where n is slotCapacity.
+
+[Invariants]
+All prior slot marks are invalid after Reset.
+*/
 func SlabAllocatorReset[T any](allocator memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
 
@@ -115,8 +144,18 @@ func SlabAllocatorReset[T any](allocator memcore.MarkRaw) {
 	}
 }
 
-// SlabAllocatorMalloc allocates one slot and returns a memcore.MarkRaw.
-//
+/*
+SlabAllocatorMalloc pops a free slot and returns a mark to uninitialized storage.
+
+[Returns]
+A memcore.MarkRaw sized to the aligned slot for T.
+
+[Errors]
+Panics when the free stack is empty.
+
+[Complexity]
+Time: O(1). Space: O(1).
+*/
 //go:nosplit
 func SlabAllocatorMalloc[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
@@ -132,8 +171,9 @@ func SlabAllocatorMalloc[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	return ptr
 }
 
-// SlabAllocatorCalloc allocates and zeroes a slot.
-//
+/*
+SlabAllocatorCalloc allocates a slot and zeroes the full slot byte span.
+*/
 //go:nosplit
 func SlabAllocatorCalloc[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
@@ -143,8 +183,12 @@ func SlabAllocatorCalloc[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	return ptr
 }
 
-// SlabAllocatorMallocUnsafe allocates without validation.
-//
+/*
+SlabAllocatorMallocUnsafe pops a free slot without checking for exhaustion beyond stack underflow.
+
+[Errors]
+Panics if the free stack is empty (via StackPopUnsafe).
+*/
 //go:nosplit
 func SlabAllocatorMallocUnsafe[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
@@ -156,8 +200,9 @@ func SlabAllocatorMallocUnsafe[T any](allocator memcore.MarkRaw) memcore.MarkRaw
 	return ptr
 }
 
-// SlabAllocatorCallocUnsafe allocates and zeroes memory without validation.
-//
+/*
+SlabAllocatorCallocUnsafe allocates via MallocUnsafe and zeroes SizeOf[T] bytes (not the full slot padding).
+*/
 //go:nosplit
 func SlabAllocatorCallocUnsafe[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	ptr := SlabAllocatorMallocUnsafe[T](allocator)
@@ -166,9 +211,19 @@ func SlabAllocatorCallocUnsafe[T any](allocator memcore.MarkRaw) memcore.MarkRaw
 }
 
 /*
-SlabAllocatorFree returns a slot back to the allocator.
+SlabAllocatorFree returns a slot index to the free stack.
 
-It does NOT free memory, so using Malloc on a previously returned slot can cause garbage.
+[Parameters]
+slot - Mark previously returned by this allocator's Malloc family for the same T.
+
+[Errors]
+Panics if slot is outside the data region, misaligned, or has an invalid slot index.
+
+[Side Effects]
+Does not clear slot bytes; a later Malloc may reuse stale contents unless the client zeroes or uses Calloc.
+
+[Invariants]
+Do not use slot after Free. Malloc after Free without zeroing may observe old data.
 */
 func SlabAllocatorFree[T any](allocator memcore.MarkRaw, slot memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
@@ -192,11 +247,10 @@ func SlabAllocatorFree[T any](allocator memcore.MarkRaw, slot memcore.MarkRaw) {
 }
 
 /*
-SlabAllocatorFreeUnsafe returns a slot back to the allocator.
+SlabAllocatorFreeUnsafe returns a slot to the free stack without bounds or alignment checks.
 
-It does NOT free memory, so using Malloc on a previously returned slot can cause garbage.
-
-This variant does NOT do bounds checks.
+[Side Effects]
+Same reuse semantics as SlabAllocatorFree; incorrect slot marks corrupt the free stack.
 */
 func SlabAllocatorFreeUnsafe[T any](allocator memcore.MarkRaw, slot memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
@@ -207,24 +261,36 @@ func SlabAllocatorFreeUnsafe[T any](allocator memcore.MarkRaw, slot memcore.Mark
 	memforgeAllocationRemove(allocator, slot)
 }
 
-// Convenience wrappers (typed access)
-// They only exist for ergonomic access in Go code, and never store Go pointers.
+/*
+SlabAllocatorMallocObject returns a *T view of a new slab slot (uninitialized).
 
+[Side Effects]
+Convenience wrapper only; does not store Go pointers in manual memory.
+*/
 func SlabAllocatorMallocObject[T any](allocator memcore.MarkRaw) *T {
 	ptr := SlabAllocatorMalloc[T](allocator)
 	return memcore.MemcoreMarkDereferenceObject[T](ptr)
 }
 
+/*
+SlabAllocatorCallocObject returns a *T view of a zeroed slab slot.
+*/
 func SlabAllocatorCallocObject[T any](allocator memcore.MarkRaw) *T {
 	ptr := SlabAllocatorCalloc[T](allocator)
 	return memcore.MemcoreMarkDereferenceObject[T](ptr)
 }
 
+/*
+SlabAllocatorMallocObjectUnsafe returns a *T view via SlabAllocatorMallocUnsafe.
+*/
 func SlabAllocatorMallocObjectUnsafe[T any](allocator memcore.MarkRaw) *T {
 	ptr := SlabAllocatorMallocUnsafe[T](allocator)
 	return memcore.MemcoreMarkDereferenceObject[T](ptr)
 }
 
+/*
+SlabAllocatorCallocObjectUnsafe returns a *T view via SlabAllocatorCallocUnsafe.
+*/
 func SlabAllocatorCallocObjectUnsafe[T any](allocator memcore.MarkRaw) *T {
 	ptr := SlabAllocatorCallocUnsafe[T](allocator)
 	return memcore.MemcoreMarkDereferenceObject[T](ptr)

@@ -21,16 +21,27 @@ type freeMemoryRegionBlock struct {
 	sizeBytes   uint64 // Total size in bytes
 }
 
-// FixedManualAllocator provides low-level manual allocation/freeing
-// within a fixed-size memory-mapped region. It uses `memcore.MarkRaw`
-// as the single authoritative representation of all allocations.
-//
-// Characteristics:
-//   - No runtime GC overhead
-//   - Deterministic layout
-//   - Stable pointers (no relocation)
-//   - Manual allocation and freeing
-//   - Not thread-safe
+/*
+FixedManualAllocator is a fixed-size general-purpose allocator with malloc/free semantics.
+
+[Context]
+Supports arbitrary sizes and alignments within a single mmap arena. Frees coalesce adjacent free
+regions. Metadata (free list and allocation records) lives in an embedded FixedLinearAllocator.
+Use for persistent subsystems, registries, and sparse lifetimes within one region.
+
+[Complexity]
+Malloc and Free: O(n) over free regions in the worst case; typically much better with the region hint.
+
+[Side Effects]
+Malloc and Free mutate free lists and allocation records. Pointers are stable (no relocation).
+
+[Thread Safety]
+Not safe for concurrent use from multiple goroutines.
+
+[Invariants]
+Every allocation must be freed or the whole allocator reset or destroyed. Do not store Go pointers
+in allocator-managed memory. Double-free or freeing foreign marks panic.
+*/
 type FixedManualAllocator struct {
 	allocatorAddr       uintptr
 	allocatorRegionSize uint64
@@ -49,8 +60,18 @@ type FixedManualAllocator struct {
 
 // ---------------------------------- CREATION & DESTRUCTION ----------------------------------
 
-// FixedManualAllocatorCreate creates a new manual allocator managing
-// `sizeBytes` of memory.
+/*
+FixedManualAllocatorCreate maps a region and initializes a manual allocator.
+
+[Parameters]
+sizeBytes - Data arena capacity excluding the allocator header.
+
+[Returns]
+A memcore.MarkRaw to the allocator header.
+
+[Errors]
+Panics if mmap fails or metadata list capacity is insufficient.
+*/
 func FixedManualAllocatorCreate(sizeBytes uint64) memcore.MarkRaw {
 	headerSize := memcore.SizeOf[FixedManualAllocator]()
 	headerAlignedSize := alignIdxUp(uint64(headerSize), uint64(allocatorDataAddrAlignment))
@@ -118,10 +139,12 @@ func FixedManualAllocatorCreate(sizeBytes uint64) memcore.MarkRaw {
 	return allocatorPtr
 }
 
-// FixedManualAllocatorDestroy releases all memory associated with the allocator,
-// unregistering its namespace and invalidating all pointers created from it.
-//
-// Using the allocator after destruction will panic.
+/*
+FixedManualAllocatorDestroy destroys metadata allocator, unmaps the region, and clears telemetry.
+
+[Invariants]
+The allocator and all marks from it must not be used after this call.
+*/
 func FixedManualAllocatorDestroy(allocator memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 
@@ -138,11 +161,19 @@ func FixedManualAllocatorDestroy(allocator memcore.MarkRaw) {
 
 // ---------------------------------- ALLOCATION ----------------------------------
 
-// FixedManualAllocatorMalloc allocates a manually managed memory block of
-// `sizeBytes` and `alignment`, returning a `memcore.MarkRaw` to it.
-// The memory is uninitialized and may contain garbage.
-//
-// Panics if insufficient free space exists.
+/*
+FixedManualAllocatorMalloc allocates sizeBytes with alignment from the first fitting free region.
+
+[Parameters]
+sizeBytes - Requested allocation size in bytes.
+alignment - Required alignment; must be a power of two greater than zero.
+
+[Returns]
+A memcore.MarkRaw to uninitialized memory.
+
+[Errors]
+Panics on invalid alignment or when no free region can satisfy the request (includes fragmentation diagnostics).
+*/
 func FixedManualAllocatorMalloc(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 	alignmentValidate(alignment)
@@ -160,7 +191,9 @@ func FixedManualAllocatorMalloc(allocator memcore.MarkRaw, sizeBytes, alignment 
 	return ptr
 }
 
-// FixedManualAllocatorMallocUnsafe is identical to Malloc but skips alignment validation.
+/*
+FixedManualAllocatorMallocUnsafe is identical to FixedManualAllocatorMalloc but skips alignment validation.
+*/
 func FixedManualAllocatorMallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 	regionIdx, alignedIdx, spaceBefore, spaceAfter, err := getFreeAlignedIdx(header, sizeBytes, alignment)
@@ -175,22 +208,30 @@ func FixedManualAllocatorMallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alig
 	return ptr
 }
 
-// FixedManualAllocatorCalloc allocates and zeroes a block of memory.
+/*
+FixedManualAllocatorCalloc allocates with alignment and zeroes the block.
+*/
 func FixedManualAllocatorCalloc(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	ptr := FixedManualAllocatorMalloc(allocator, sizeBytes, alignment)
 	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(sizeBytes))
 	return ptr
 }
 
-// FixedManualAllocatorCallocUnsafe allocates and zeroes a block without alignment validation.
+/*
+FixedManualAllocatorCallocUnsafe allocates and zeroes without alignment validation.
+*/
 func FixedManualAllocatorCallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	ptr := FixedManualAllocatorMallocUnsafe(allocator, sizeBytes, alignment)
 	memcore.MemoryClearNoHeapPointers(memcore.MemcoreMarkDereference(ptr), uintptr(sizeBytes))
 	return ptr
 }
 
-// FixedManualAllocatorMallocObject allocates and returns a typed object.
-// It returns a memcore.MarkRaw to the object, properly aligned.
+/*
+FixedManualAllocatorMallocObject allocates storage for T using SizeOf and AlignOf.
+
+[Returns]
+A memcore.MarkRaw to uninitialized memory.
+*/
 func FixedManualAllocatorMallocObject[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
@@ -198,8 +239,12 @@ func FixedManualAllocatorMallocObject[T any](allocator memcore.MarkRaw) memcore.
 	return ptr
 }
 
-// FixedManualAllocatorCallocObject allocates a zeroed typed object.
-// It returns a memcore.MarkRaw to the object.
+/*
+FixedManualAllocatorCallocObject allocates a zeroed value of T.
+
+[Returns]
+A memcore.MarkRaw to zeroed memory.
+*/
 func FixedManualAllocatorCallocObject[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	size := memcore.SizeOf[T]()
 	align := memcore.AlignOf[T]()
@@ -209,9 +254,18 @@ func FixedManualAllocatorCallocObject[T any](allocator memcore.MarkRaw) memcore.
 
 // ---------------------------------- FREE ----------------------------------
 
-// FixedManualAllocatorFree releases a previously allocated block and merges
-// it with adjacent free regions if possible. Panics if the pointer was not
-// allocated by this allocator.
+/*
+FixedManualAllocatorFree returns a block to the free list and coalesces with neighbors when possible.
+
+[Parameters]
+target - Mark previously returned by this allocator's Malloc family.
+
+[Errors]
+Panics if target is unknown, double-freed, or not owned by this allocator.
+
+[Side Effects]
+Removes the allocation from tracking and may merge adjacent free regions.
+*/
 func FixedManualAllocatorFree(allocator memcore.MarkRaw, target memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 	rec, refIdx := fixedManualAllocatorFindRef(header, target)
@@ -224,8 +278,15 @@ func FixedManualAllocatorFree(allocator memcore.MarkRaw, target memcore.MarkRaw)
 
 // ---------------------------------- RESET ----------------------------------
 
-// FixedManualAllocatorReset clears all allocations, restoring the entire
-// region as a single free block. All previously returned pointers become invalid.
+/*
+FixedManualAllocatorReset clears all live allocations and restores one free span over the data arena.
+
+[Complexity]
+Time: O(1) for list clears plus O(1) to seed the free block (metadata lists are cleared, not walked per allocation).
+
+[Invariants]
+All prior marks are invalid after Reset; they must not be freed or dereferenced.
+*/
 func FixedManualAllocatorReset(allocator memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 

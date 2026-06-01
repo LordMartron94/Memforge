@@ -5,6 +5,9 @@ import (
 	"memcore"
 )
 
+/*
+DynamicLinearAllocatorGrowthMaxViolation reports a capped growth strategy exceeding maxCapacityBytes.
+*/
 type DynamicLinearAllocatorGrowthMaxViolation struct {
 	MaxCapacity uint64
 	Required    uint64
@@ -19,11 +22,24 @@ func (e DynamicLinearAllocatorGrowthMaxViolation) Error() string {
 }
 
 /*
-DynamicLinearAllocatorGrowthDoubleOrNeeded grows capacity by doubling, unless the
-required capacity is larger than doubled capacity.
+DynamicLinearAllocatorGrowthDoubleOrNeeded doubles arena capacity unless neededCap is larger.
 
-It returns max(currentCap*2, neededCap), while handling 0-capacity starts and
-integer overflow saturation.
+[Context]
+Suitable default growth for DynamicLinearAllocator. When currentCap is zero, returns neededCap.
+Doubling saturates at max uint64 instead of wrapping.
+
+[Parameters]
+currentCap - Current arena data capacity.
+neededCap - Minimum capacity required for the pending allocation.
+
+[Returns]
+max(currentCap*2, neededCap) with saturation when doubling overflows.
+
+[Complexity]
+Time: O(1). Space: O(1).
+
+[Side Effects]
+Pure function.
 */
 func DynamicLinearAllocatorGrowthDoubleOrNeeded(currentCap, neededCap uint64) uint64 {
 	if currentCap == 0 {
@@ -39,12 +55,19 @@ func DynamicLinearAllocatorGrowthDoubleOrNeeded(currentCap, neededCap uint64) ui
 }
 
 /*
-DynamicLinearAllocatorGrowthTemplateDoubleOrNeededWithMaxPanic creates a growth
-strategy that uses DynamicLinearAllocatorGrowthDoubleOrNeeded and enforces a
-hard max capacity.
+DynamicLinearAllocatorGrowthTemplateDoubleOrNeededWithMaxPanic wraps double-or-needed growth with a hard cap.
 
-The returned strategy panics with DynamicLinearAllocatorGrowthMaxViolation when
-the computed capacity exceeds maxCapacityBytes.
+[Parameters]
+maxCapacityBytes - Maximum allowed arena data capacity.
+
+[Returns]
+A GrowthStrategy suitable for DynamicLinearAllocatorCreateFunction.
+
+[Errors]
+Panics with DynamicLinearAllocatorGrowthMaxViolation when proposed capacity exceeds maxCapacityBytes.
+
+[Side Effects]
+Pure factory; the returned closure panics on violation during growth.
 */
 func DynamicLinearAllocatorGrowthTemplateDoubleOrNeededWithMaxPanic(maxCapacityBytes uint64) GrowthStrategy {
 	return func(currentCap, neededCap uint64) uint64 {
@@ -62,8 +85,13 @@ func DynamicLinearAllocatorGrowthTemplateDoubleOrNeededWithMaxPanic(maxCapacityB
 }
 
 /*
-DynamicLinearAllocatorGrowthTemplateDoubleOrNeededWithMaxPanicID registers a
-max-limited growth strategy and returns its memcore function ID.
+DynamicLinearAllocatorGrowthTemplateDoubleOrNeededWithMaxPanicID registers the max-limited growth strategy.
+
+[Returns]
+A memcore.FunctionID for use with DynamicLinearAllocatorCreate.
+
+[Side Effects]
+Registers the strategy in memcore's function table.
 */
 func DynamicLinearAllocatorGrowthTemplateDoubleOrNeededWithMaxPanicID(maxCapacityBytes uint64) memcore.FunctionID {
 	strategy := DynamicLinearAllocatorGrowthTemplateDoubleOrNeededWithMaxPanic(maxCapacityBytes)
