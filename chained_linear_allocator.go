@@ -37,7 +37,7 @@ type ChainedLinearAllocator struct {
 	bumpIndex      uint64
 	activeCapacity uint64
 	growthHookID   memcore.FunctionID
-	regionHistory  memcore.MarkRaw // FixedOrderedList[uint32] in header-store metadata
+	regionHistory  *memstruct.FixedOrderedList[uint32] // co-located in header-store metadata
 }
 
 /*
@@ -68,14 +68,14 @@ func chainedLinearAllocatorCreateInternal(initial MemforgeDataBacking, growthHoo
 	historyAlign := memstruct.FixedOrderedListRequiredAlignment[uint32]()
 	metaMark := memforgeHeaderAllocate(historyBytes, historyAlign)
 	memstruct.FixedOrderedListInitializeAt[uint32](metaMark, maxHistoryRegions)
-	memstruct.FixedOrderedListAppendUnsafe(metaMark, initial.DataRegionID)
 
 	header := memcore.MemcoreMarkDereferenceObject[ChainedLinearAllocator](headerMark)
 	header.activeRegionID = initial.DataRegionID
 	header.activeCapacity = initial.DataCapBytes
 	header.bumpIndex = 0
 	header.growthHookID = growthHookID
-	header.regionHistory = metaMark
+	header.regionHistory = memcore.MemcoreMarkDereferenceObjectUnsafe[memstruct.FixedOrderedList[uint32]](metaMark)
+	memstruct.FixedOrderedListAppendUnsafeFast(header.regionHistory, initial.DataRegionID)
 
 	memforgeAllocatorRegister(headerMark, "Chained Linear", tag, initial.DataRegionID, initial.DataCapBytes, initial.DataCapBytes)
 	return headerMark
@@ -133,12 +133,12 @@ func ChainedLinearAllocatorReset(allocator memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[ChainedLinearAllocator](allocator)
 	memforgeAllocatorRemoveAll(allocator)
 
-	if memstruct.FixedOrderedListLengthGet[uint32](header.regionHistory) == 0 {
+	if memstruct.FixedOrderedListLengthGetFast(header.regionHistory) == 0 {
 		header.bumpIndex = 0
 		return
 	}
 
-	firstRegion, err := memstruct.FixedOrderedListItemGetAt[uint32](header.regionHistory, 0)
+	firstRegion, err := memstruct.FixedOrderedListItemGetAtFast(header.regionHistory, 0)
 	if err != nil {
 		panic(fmt.Errorf("chained linear allocator: invalid region history: %w", err))
 	}
@@ -167,22 +167,22 @@ func chainedLinearAllocatorPivot(header *ChainedLinearAllocator, requestedSize u
 		panic(fmt.Errorf("chained linear allocator: growth hook returned capacity %d < requested %d", newCapacity, requestedSize))
 	}
 
-	historyLen := memstruct.FixedOrderedListLengthGet[uint32](header.regionHistory)
+	historyLen := memstruct.FixedOrderedListLengthGetFast(header.regionHistory)
 	if historyLen > 0 {
-		lastRegion, err := memstruct.FixedOrderedListItemGetAt[uint32](header.regionHistory, historyLen-1)
+		lastRegion, err := memstruct.FixedOrderedListItemGetAtFast(header.regionHistory, historyLen-1)
 		if err != nil {
 			panic(fmt.Errorf("chained linear allocator: invalid region history: %w", err))
 		}
 		if lastRegion != header.activeRegionID {
-			memstruct.FixedOrderedListAppendUnsafe(header.regionHistory, header.activeRegionID)
+			memstruct.FixedOrderedListAppendUnsafeFast(header.regionHistory, header.activeRegionID)
 		}
 	} else {
-		memstruct.FixedOrderedListAppendUnsafe(header.regionHistory, header.activeRegionID)
+		memstruct.FixedOrderedListAppendUnsafeFast(header.regionHistory, header.activeRegionID)
 	}
 
 	header.activeRegionID = newRegionID
 	header.activeCapacity = newCapacity
 	header.bumpIndex = 0
 
-	memstruct.FixedOrderedListAppendUnsafe(header.regionHistory, newRegionID)
+	memstruct.FixedOrderedListAppendUnsafeFast(header.regionHistory, newRegionID)
 }

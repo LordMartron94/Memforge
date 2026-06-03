@@ -29,7 +29,7 @@ type FixedSlabAllocator[T any] struct {
 	slotSize      uint64
 	slotAlignment uint64
 	slotCapacity  uint64
-	freeStack     memcore.MarkRaw
+	freeStack     *memstruct.Stack[uint64]
 	metaAllocator memcore.MarkRaw
 }
 
@@ -94,7 +94,7 @@ func slabAllocatorCreateInternal[T any](
 	header.slotSize = slotSize
 	header.slotAlignment = slotAlignment
 	header.slotCapacity = capacity
-	header.freeStack = stackPtr
+	header.freeStack = memcore.MemcoreMarkDereferenceObjectUnsafe[memstruct.Stack[uint64]](stackPtr)
 	header.metaAllocator = metaAlloc
 
 	memforgeAllocatorRegister(headerMark, debugName, tag, backing.DataRegionID, dataBytes, dataBytes)
@@ -114,9 +114,9 @@ func SlabAllocatorReset[T any](allocator memcore.MarkRaw) {
 
 	memforgeAllocatorRemoveAll(allocator)
 
-	memstruct.StackClear[uint64](header.freeStack)
+	memstruct.StackClearFast(header.freeStack)
 	for i := header.slotCapacity; i > 0; i-- {
-		memstruct.StackPushUnsafe(header.freeStack, i-1)
+		memstruct.StackPushUnsafeFastAuto(header.freeStack, i-1)
 	}
 }
 
@@ -124,7 +124,7 @@ func SlabAllocatorReset[T any](allocator memcore.MarkRaw) {
 func SlabAllocatorMalloc[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
 
-	idx, err := memstruct.StackPop[uint64](header.freeStack)
+	idx, err := memstruct.StackPopFastAuto(header.freeStack)
 	if err != nil {
 		panic(fmt.Errorf("slab allocator: out of memory: %w", err))
 	}
@@ -144,7 +144,7 @@ func SlabAllocatorCalloc[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 //go:nosplit
 func SlabAllocatorMallocUnsafe[T any](allocator memcore.MarkRaw) memcore.MarkRaw {
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
-	idx := memstruct.StackPopUnsafe[uint64](header.freeStack)
+	idx := memstruct.StackPopUnsafeFastAuto(header.freeStack)
 
 	ptr := slabAllocatorMarkFromSlotIndex(header, idx)
 	memforgeAllocationAdd(allocator, ptr, header.slotSize)
@@ -165,7 +165,7 @@ func SlabAllocatorFree[T any](allocator memcore.MarkRaw, slot memcore.MarkRaw) {
 		panic(fmt.Errorf("invalid slot idx (%d) which is outside of capacity (%d)", slotDataIdx, header.slotCapacity))
 	}
 
-	memstruct.StackPushUnsafe(header.freeStack, slotDataIdx)
+	memstruct.StackPushUnsafeFastAuto(header.freeStack, slotDataIdx)
 	memforgeAllocationRemove(allocator, slot)
 }
 
@@ -173,7 +173,7 @@ func SlabAllocatorFreeUnsafe[T any](allocator memcore.MarkRaw, slot memcore.Mark
 	header := memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[T]](allocator)
 	_, slotDataIdx := slabAllocatorSlotIndexFromMark(header, slot)
 
-	memstruct.StackPushUnsafe(header.freeStack, slotDataIdx)
+	memstruct.StackPushUnsafeFastAuto(header.freeStack, slotDataIdx)
 	memforgeAllocationRemove(allocator, slot)
 }
 
