@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"memcore"
 	"memstruct"
-	"unsafe"
 )
 
 const allocatorFailureCountResetHeuristic uint8 = 5
@@ -43,17 +42,12 @@ Every allocation must be freed or the whole allocator reset or destroyed. Do not
 in allocator-managed memory. Double-free or freeing foreign marks panic.
 */
 type FixedManualAllocator struct {
-	allocatorAddr       uintptr
-	allocatorRegionSize uint64
-	dataRegionOffset    uintptr
-	addressSpace        uint32
-	storage             memcore.MemoryMap
+	linearAllocatorState
 
 	metadataAllocator memcore.MarkRaw // FixedLinearAllocator
 	freeMemory        memcore.MarkRaw // FixedOrderedList[freeMemoryRegionBlock]
 	ptrRefs           memcore.MarkRaw // FixedOrderedList[allocationRecord]
 
-	dataBytesCap          uint64
 	regionIdxAreaHint     uint64
 	regionIdxFailureCount uint8
 }
@@ -72,71 +66,67 @@ A memcore.MarkRaw to the allocator header.
 [Errors]
 Panics if mmap fails or metadata list capacity is insufficient.
 */
-func FixedManualAllocatorCreate(sizeBytes uint64) memcore.MarkRaw {
-	headerSize := memcore.SizeOf[FixedManualAllocator]()
-	headerAlignedSize := alignIdxUp(uint64(headerSize), uint64(allocatorDataAddrAlignment))
+func FixedManualAllocatorCreate(sizeBytes uint64, tag string) memcore.MarkRaw {
+	backing, mmapBase, mmap := memforgeDataBackingCreateFromMmap(sizeBytes)
+	return fixedManualAllocatorCreateInternal(backing, true, mmapBase, uint64(len(mmap)), "Fixed Manual (Mmap)", tag)
+}
 
-	totalSize := headerAlignedSize + uint64(sizeBytes)
+/*
+FixedManualAllocatorCreateForDataRegion initializes a manual allocator over caller-owned data.
 
-	mmap, err := memcore.MemmapRequest(int(totalSize), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
-	if err != nil {
-		panic(fmt.Errorf("manual allocator: mmap failed: %w", err))
-	}
+[Parameters]
+backing - Pre-registered memcore data region. memforge does not unregister this region on Destroy.
+*/
+func FixedManualAllocatorCreateForDataRegion(backing MemforgeDataBacking, tag string) memcore.MarkRaw {
+	return fixedManualAllocatorCreateInternal(backing, false, 0, 0, "Fixed Manual (External)", tag)
+}
 
-	allocatorPtrRaw := unsafe.Pointer(&mmap[0])
-	allocatorAddr := uintptr(allocatorPtrRaw)
+func fixedManualAllocatorCreateInternal(
+	backing MemforgeDataBacking,
+	ownsDataRegion bool,
+	dataMmapBase uintptr,
+	dataMmapSize uint64,
+	debugName string,
+	tag string,
+) memcore.MarkRaw {
+	sizeBytes := backing.DataCapBytes
 
-	regionID := memcore.MemcoreRegionRegister(allocatorAddr, totalSize)
-
-	// Allocate and register allocator header pointer
-	allocatorPtr := memcore.MemcoreMarkCreate(regionID, 0)
-	allocator := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocatorPtr)
-
-	// Determine metadata capacity heuristics
 	minTrack := memcore.SizeOf[uintptr]()
 	if sizeBytes < uint64(minTrack) {
 		sizeBytes = uint64(minTrack)
 	}
-	maxAllocs := sizeBytes / uint64(minTrack)
+	maxAllocs := backing.DataCapBytes / uint64(minTrack)
 
-	// Allocate metadata arena
 	ptrRefBytes := alignIdxUp(memstruct.FixedOrderedListRequiredBytes[allocationRecord](maxAllocs), memstruct.FixedOrderedListRequiredAlignment[allocationRecord]())
 	freeListBytes := alignIdxUp(memstruct.FixedOrderedListRequiredBytes[freeMemoryRegionBlock](maxAllocs), memstruct.FixedOrderedListRequiredAlignment[freeMemoryRegionBlock]())
 	metaBytes := ptrRefBytes + freeListBytes
-	metaAlloc := FixedLinearAllocatorCreate(metaBytes)
+	metaAlloc := FixedLinearAllocatorCreate(metaBytes, "Allocator Metadata")
 
-	// Allocate list memory
 	ptrRefsPtr := FixedLinearAllocatorMalloc(metaAlloc, ptrRefBytes, memcore.AlignOf[memstruct.FixedOrderedList[allocationRecord]]())
-
 	freeListPtr := FixedLinearAllocatorMalloc(metaAlloc, freeListBytes, memcore.AlignOf[memstruct.FixedOrderedList[freeMemoryRegionBlock]]())
 
-	// Initialize metadata lists
 	memstruct.FixedOrderedListInitializeAt[allocationRecord](ptrRefsPtr, maxAllocs)
 	memstruct.FixedOrderedListInitializeAt[freeMemoryRegionBlock](freeListPtr, maxAllocs)
 
-	// Initialize full free region
 	memstruct.FixedOrderedListAppendUnsafe(freeListPtr, freeMemoryRegionBlock{
 		memStartIdx: 0,
-		sizeBytes:   sizeBytes,
+		sizeBytes:   backing.DataCapBytes,
 	})
 
-	// Write allocator header
-	*allocator = FixedManualAllocator{
-		allocatorAddr:         allocatorAddr,
-		dataRegionOffset:      uintptr(headerAlignedSize),
-		allocatorRegionSize:   totalSize,
-		addressSpace:          regionID,
-		storage:               mmap,
-		metadataAllocator:     metaAlloc,
-		freeMemory:            freeListPtr,
-		ptrRefs:               ptrRefsPtr,
-		dataBytesCap:          sizeBytes,
-		regionIdxAreaHint:     0,
-		regionIdxFailureCount: 0,
-	}
+	headerMark := memforgeHeaderAllocate(
+		uint64(memcore.SizeOf[FixedManualAllocator]()),
+		uint64(memcore.AlignOf[FixedManualAllocator]()),
+	)
+	allocator := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](headerMark)
+	allocator.linearAllocatorState = linearAllocatorStateInit(backing, ownsDataRegion, dataMmapBase, dataMmapSize)
+	allocator.metadataAllocator = metaAlloc
+	allocator.freeMemory = freeListPtr
+	allocator.ptrRefs = ptrRefsPtr
+	allocator.regionIdxAreaHint = 0
+	allocator.regionIdxFailureCount = 0
 
-	memforgeAllocatorRegister(allocatorPtr, "Fixed Manual (Pointer)", sizeBytes, totalSize)
-	return allocatorPtr
+	memforgeAllocatorRegister(headerMark, debugName, tag, backing.DataRegionID, backing.DataCapBytes, backing.DataCapBytes)
+	return headerMark
 }
 
 /*
@@ -149,14 +139,8 @@ func FixedManualAllocatorDestroy(allocator memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[FixedManualAllocator](allocator)
 
 	memforgeAllocatorDestroy(allocator)
-
-	memcore.MemcoreRegionUnregister(header.addressSpace)
-
 	FixedLinearAllocatorDestroy(header.metadataAllocator)
-
-	if err := memcore.MemmapUnmapAt(unsafe.Pointer(header.allocatorAddr), int(header.allocatorRegionSize)); err != nil {
-		panic(fmt.Errorf("manual allocator: unmap failed: %w", err))
-	}
+	linearAllocatorStateDestroy(&header.linearAllocatorState)
 }
 
 // ---------------------------------- ALLOCATION ----------------------------------
@@ -185,7 +169,7 @@ func FixedManualAllocatorMalloc(allocator memcore.MarkRaw, sizeBytes, alignment 
 	updateFreeListAfterAllocation(header, regionIdx, alignedIdx, sizeBytes, spaceBefore, spaceAfter)
 
 	offset := uintptr(alignedIdx)
-	ptr := memcore.MemcoreMarkOffsetFrom(allocator, header.dataRegionOffset+offset)
+	ptr := memcore.MemcoreMarkCreate(header.dataRegionID, offset)
 	memforgeAllocationAdd(allocator, ptr, sizeBytes)
 	insertAllocationRecord(header, ptr, sizeBytes)
 	return ptr
@@ -202,7 +186,7 @@ func FixedManualAllocatorMallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alig
 	}
 	updateFreeListAfterAllocation(header, regionIdx, alignedIdx, sizeBytes, spaceBefore, spaceAfter)
 	offset := uintptr(alignedIdx)
-	ptr := memcore.MemcoreMarkOffsetFrom(allocator, header.dataRegionOffset+offset)
+	ptr := memcore.MemcoreMarkCreate(header.dataRegionID, offset)
 	memforgeAllocationAdd(allocator, ptr, sizeBytes)
 	insertAllocationRecord(header, ptr, sizeBytes)
 	return ptr
@@ -296,7 +280,7 @@ func FixedManualAllocatorReset(allocator memcore.MarkRaw) {
 	memstruct.FixedOrderedListClear[allocationRecord](header.ptrRefs)
 	memstruct.FixedOrderedListAppendUnsafe(header.freeMemory, freeMemoryRegionBlock{
 		memStartIdx: 0,
-		sizeBytes:   header.dataBytesCap,
+		sizeBytes:   header.dataCapBytes,
 	})
 	header.regionIdxAreaHint = 0
 	header.regionIdxFailureCount = 0
@@ -539,7 +523,6 @@ func freeAlignedIdxLoop(
 			"  Active Free Regions: %d\n"+
 			"  Smallest Free Block: %d bytes\n"+
 			"  Largest Free Block:  %d bytes\n"+
-			"  Allocator Data Off:  0x%x\n"+
 			"  Region Hint Index:   %d\n"+
 			"  Hint Failure Count:  %d\n"+
 			"  Possible Cause:      fragmentation, misalignment, or data offset overflow",
@@ -551,7 +534,6 @@ func freeAlignedIdxLoop(
 		activeRegions,
 		smallestFree,
 		largestFree,
-		a.dataRegionOffset,
 		a.regionIdxAreaHint,
 		a.regionIdxFailureCount,
 	)
@@ -561,5 +543,8 @@ func freeAlignedIdxLoop(
 
 //go:inline
 func fixedManualAllocatorGetIdxRelativeToDataRegion(a *FixedManualAllocator, pointer memcore.MarkRaw) uintptr {
-	return memcore.MemcoreMarkSubtractBaseOffset(pointer, a.dataRegionOffset)
+	if memcore.MemcoreMarkRegionIDGet(pointer) != a.dataRegionID {
+		panic(fmt.Errorf("manual allocator: mark belongs to foreign region"))
+	}
+	return memcore.MemcoreMarkOffsetGet(pointer)
 }

@@ -3,15 +3,14 @@ package memforge
 import (
 	"fmt"
 	"memcore"
-	"unsafe"
 )
 
 /*
-FixedLinearAllocator is a fixed-capacity bump (arena) allocator in a single mmap region.
+FixedLinearAllocator is a fixed-capacity bump (arena) allocator backed by one data region.
 
 [Context]
-The header and arena live in one memcore region. Allocations advance a bump index sequentially;
-individual frees are not supported. Use for scratch buffers, frame arenas, and other transient
+Allocator state lives in the memforge CPU header store. Data allocations are marks in the data
+region namespace starting at offset zero. Use for scratch buffers, frame arenas, and other transient
 workspaces scoped to Reset or Destroy.
 
 [Complexity]
@@ -29,67 +28,69 @@ Do not store Go pointers in allocator-managed memory. Pointers become invalid af
 alignment passed to Malloc must be a power of two greater than zero.
 */
 type FixedLinearAllocator struct {
-	allocatorAddr      uintptr
-	allocatorTotalSize uint64
-	dataBaseOffset     uintptr
-	regionID           uint32
-	dataByteIdx        uint64
-	dataCapBytes       uint64
+	linearAllocatorState
 }
 
 /*
-FixedLinearAllocatorCreate maps a new region and initializes a fixed linear allocator.
+FixedLinearAllocatorCreate maps a new data region and initializes a fixed linear allocator.
 
 [Parameters]
-sizeBytes - Capacity of the bump arena excluding the allocator header.
+sizeBytes - Capacity of the bump arena.
+tag - Human-readable label recorded by the memforge debugger (for example "Renderer Scratch").
 
 [Returns]
-A memcore.MarkRaw to the allocator header in the new region namespace.
+A memcore.MarkRaw to the allocator header in the memforge header store.
 
 [Errors]
 Panics if mmap fails.
 
 [Side Effects]
-Registers a memcore region and memforge allocator telemetry entry.
+Registers a memcore data region and memforge allocator telemetry entry.
 */
-func FixedLinearAllocatorCreate(sizeBytes uint64) memcore.MarkRaw {
-	headerSize := memcore.SizeOf[FixedLinearAllocator]()
-	headerAlignedSize := alignIdxUp(uint64(headerSize), uint64(allocatorDataAddrAlignment))
-
-	totalSize := headerAlignedSize + sizeBytes
-
-	mmap, err := memcore.MemmapRequest(int(totalSize), memcore.PROT_READWRITE, memcore.MAP_ANON_PRIVATE)
-	if err != nil {
-		panic(fmt.Errorf("failed to create linear allocator: %w", err))
-	}
-
-	allocatorPtrRaw := unsafe.Pointer(&mmap[0])
-	allocatorAddr := uintptr(allocatorPtrRaw)
-
-	regionID := memcore.MemcoreRegionRegister(allocatorAddr, totalSize)
-
-	allocatorPtr := memcore.MemcoreMarkCreate(regionID, 0)
-
-	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](allocatorPtr)
-	*header = FixedLinearAllocator{
-		allocatorAddr:      allocatorAddr,
-		allocatorTotalSize: totalSize,
-		dataBaseOffset:     uintptr(headerAlignedSize),
-		regionID:           regionID,
-		dataByteIdx:        0,
-		dataCapBytes:       sizeBytes,
-	}
-
-	memforgeAllocatorRegister(allocatorPtr, "Fixed Linear (Manual)", sizeBytes, totalSize)
-
-	return allocatorPtr
+func FixedLinearAllocatorCreate(sizeBytes uint64, tag string) memcore.MarkRaw {
+	backing, mmapBase, mmap := memforgeDataBackingCreateFromMmap(sizeBytes)
+	return fixedLinearAllocatorCreateInternal(backing, true, mmapBase, uint64(len(mmap)), "Fixed Linear (Mmap)", tag)
 }
 
 /*
-FixedLinearAllocatorDestroy unmaps the region and unregisters all tracked allocations.
+FixedLinearAllocatorCreateForDataRegion initializes a fixed linear allocator over caller-owned data.
+
+[Parameters]
+backing - Pre-registered memcore region and capacity. memforge does not unregister this region on Destroy.
+
+[Returns]
+A memcore.MarkRaw to the allocator header in the memforge header store.
+*/
+func FixedLinearAllocatorCreateForDataRegion(backing MemforgeDataBacking, tag string) memcore.MarkRaw {
+	return fixedLinearAllocatorCreateInternal(backing, false, 0, 0, "Fixed Linear (External)", tag)
+}
+
+func fixedLinearAllocatorCreateInternal(
+	backing MemforgeDataBacking,
+	ownsDataRegion bool,
+	dataMmapBase uintptr,
+	dataMmapSize uint64,
+	debugName string,
+	tag string,
+) memcore.MarkRaw {
+	headerMark := memforgeHeaderAllocate(
+		uint64(memcore.SizeOf[FixedLinearAllocator]()),
+		uint64(memcore.AlignOf[FixedLinearAllocator]()),
+	)
+
+	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](headerMark)
+	header.linearAllocatorState = linearAllocatorStateInit(backing, ownsDataRegion, dataMmapBase, dataMmapSize)
+
+	memforgeAllocatorRegister(headerMark, debugName, tag, backing.DataRegionID, backing.DataCapBytes, backing.DataCapBytes)
+	return headerMark
+}
+
+/*
+FixedLinearAllocatorDestroy tears down telemetry and owned data regions.
 
 [Side Effects]
-Unmaps memory, unregisters the memcore region, and clears memforge telemetry for allocator.
+When the allocator owns its data region, unmaps memory and unregisters the memcore region.
+Caller-owned data regions are not unregistered.
 
 [Invariants]
 The allocator must not be used after this call; subsequent access panics or is undefined.
@@ -98,17 +99,12 @@ func FixedLinearAllocatorDestroy(allocator memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](allocator)
 
 	memforgeAllocatorDestroy(allocator)
-
-	memcore.MemcoreRegionUnregister(header.regionID)
-
-	if err := memcore.MemmapUnmapAt(unsafe.Pointer(header.allocatorAddr), int(header.allocatorTotalSize)); err != nil {
-		panic(fmt.Errorf("failed to destroy allocator: %w", err))
-	}
+	linearAllocatorStateDestroy(&header.linearAllocatorState)
 }
 
 //go:inline
-func fixedLinearAllocatorOOMError(allocator *FixedLinearAllocator, requestedSize uint64) error {
-	return fmt.Errorf("fixed linear allocator: out of memory, requested: %v, available: %v, current idx: %v, cap: %v", requestedSize, allocator.dataCapBytes-allocator.dataByteIdx, allocator.dataByteIdx, allocator.dataCapBytes)
+func fixedLinearAllocatorOOMError(state *linearAllocatorState, requestedSize uint64) error {
+	return fmt.Errorf("fixed linear allocator: out of memory, requested: %v, available: %v, current idx: %v, cap: %v", requestedSize, state.dataCapBytes-state.dataByteIdx, state.dataByteIdx, state.dataCapBytes)
 }
 
 /*
@@ -119,7 +115,7 @@ sizeBytes - Requested allocation size in bytes.
 alignment - Required alignment; must be a power of two greater than zero.
 
 [Returns]
-A memcore.MarkRaw offset into the allocator namespace. Memory is uninitialized.
+A memcore.MarkRaw in the allocator data region namespace. Memory is uninitialized.
 
 [Errors]
 Panics if alignment is invalid or the arena lacks capacity.
@@ -135,17 +131,16 @@ func FixedLinearAllocatorMalloc(allocator memcore.MarkRaw, sizeBytes, alignment 
 	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](allocator)
 	alignmentValidate(alignment)
 
-	alignedIdx := fixedLinearAllocatorDataIdxGet(header, alignment)
-	if !fixedLinearAllocatorCapacityGuarantee(header, sizeBytes, alignedIdx) {
-		panic(fixedLinearAllocatorOOMError(header, sizeBytes))
+	alignedIdx := linearAllocatorDataIdxGet(&header.linearAllocatorState, alignment)
+	if !linearAllocatorCapacityGuarantee(&header.linearAllocatorState, sizeBytes, alignedIdx) {
+		panic(fixedLinearAllocatorOOMError(&header.linearAllocatorState, sizeBytes))
 	}
 
-	offset := uintptr(alignedIdx)
-	ptr := memcore.MemcoreMarkOffsetFrom(allocator, offset)
+	ptr := linearAllocatorMallocMark(&header.linearAllocatorState, alignedIdx)
 
 	memforgeAllocationAdd(allocator, ptr, sizeBytes)
 
-	fixedLinearAllocatorIdxUpdate(header, alignedIdx, sizeBytes)
+	linearAllocatorIdxUpdate(&header.linearAllocatorState, alignedIdx, sizeBytes)
 	return ptr
 }
 
@@ -168,17 +163,16 @@ Same as FixedLinearAllocatorMalloc except alignment is not validated.
 //go:nosplit
 func FixedLinearAllocatorMallocUnsafe(allocator memcore.MarkRaw, sizeBytes, alignment uint64) memcore.MarkRaw {
 	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](allocator)
-	alignedIdx := fixedLinearAllocatorDataIdxGet(header, alignment)
+	alignedIdx := linearAllocatorDataIdxGet(&header.linearAllocatorState, alignment)
 
-	if !fixedLinearAllocatorCapacityGuarantee(header, sizeBytes, alignedIdx) {
-		panic(fixedLinearAllocatorOOMError(header, sizeBytes))
+	if !linearAllocatorCapacityGuarantee(&header.linearAllocatorState, sizeBytes, alignedIdx) {
+		panic(fixedLinearAllocatorOOMError(&header.linearAllocatorState, sizeBytes))
 	}
 
-	offset := uintptr(alignedIdx)
-	ptr := memcore.MemcoreMarkOffsetFrom(allocator, offset)
+	ptr := linearAllocatorMallocMark(&header.linearAllocatorState, alignedIdx)
 
 	memforgeAllocationAdd(allocator, ptr, sizeBytes)
-	fixedLinearAllocatorIdxUpdate(header, alignedIdx, sizeBytes)
+	linearAllocatorIdxUpdate(&header.linearAllocatorState, alignedIdx, sizeBytes)
 
 	return ptr
 }
@@ -257,22 +251,5 @@ func FixedLinearAllocatorReset(allocator memcore.MarkRaw) {
 	header := memcore.MemcoreMarkDereferenceObject[FixedLinearAllocator](allocator)
 	memforgeAllocatorRemoveAll(allocator)
 
-	header.dataByteIdx = 0
-}
-
-// -------------------------- PRIVATE HELPERS --------------------------
-
-//go:inline
-func fixedLinearAllocatorCapacityGuarantee(header *FixedLinearAllocator, requestedSize, alignedIdx uint64) bool {
-	return capacityGuarantee(alignedIdx, header.dataCapBytes+uint64(header.dataBaseOffset), requestedSize)
-}
-
-//go:inline
-func fixedLinearAllocatorDataIdxGet(header *FixedLinearAllocator, requestedAlignment uint64) uint64 {
-	return alignIdxUp(uint64(header.dataBaseOffset)+header.dataByteIdx, requestedAlignment)
-}
-
-//go:inline
-func fixedLinearAllocatorIdxUpdate(header *FixedLinearAllocator, alignedIdx, sizeBytes uint64) {
-	header.dataByteIdx = (alignedIdx - uint64(header.dataBaseOffset)) + sizeBytes
+	linearAllocatorResetState(&header.linearAllocatorState)
 }

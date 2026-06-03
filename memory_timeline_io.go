@@ -32,6 +32,8 @@ type jsonlTimelineEvent struct {
 	ArenaDataCapBytes         uint64                         `json:"arena_data_cap_bytes,omitempty"`
 	ArenaTotalBytes           uint64                         `json:"arena_total_bytes,omitempty"`
 	PreviousArenaDataCapBytes uint64                         `json:"prev_arena_data_cap_bytes,omitempty"`
+	Tag                       string                         `json:"tag,omitempty"`
+	OpaqueBacking             bool                           `json:"opaque_backing,omitempty"`
 }
 
 type jsonlTimelineSummary struct {
@@ -133,6 +135,8 @@ func timelineEventToJSONL(evt MemforgeTimelineEvent) jsonlTimelineEvent {
 	out.ArenaDataCapBytes = evt.ArenaDataCapBytes
 	out.ArenaTotalBytes = evt.ArenaTotalBytes
 	out.PreviousArenaDataCapBytes = evt.PreviousArenaDataCapBytes
+	out.OpaqueBacking = evt.OpaqueBacking
+	out.Tag = evt.Tag
 	if len(evt.FreedAllocations) > 0 {
 		out.Freed = make([]jsonlTimelineFreedAllocation, len(evt.FreedAllocations))
 		for i, freed := range evt.FreedAllocations {
@@ -169,6 +173,8 @@ func timelineEventFromJSONL(record jsonlTimelineEvent) (MemforgeTimelineEvent, e
 		ArenaDataCapBytes:         record.ArenaDataCapBytes,
 		ArenaTotalBytes:           record.ArenaTotalBytes,
 		PreviousArenaDataCapBytes: record.PreviousArenaDataCapBytes,
+		OpaqueBacking:             record.OpaqueBacking,
+		Tag:                       record.Tag,
 	}
 	if record.OriginalCreatedAt != "" {
 		origTS, err := time.Parse(time.RFC3339Nano, record.OriginalCreatedAt)

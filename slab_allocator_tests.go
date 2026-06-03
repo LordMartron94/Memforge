@@ -32,7 +32,7 @@ func TestFixedSlabAllocator(t *testing.T) {
 // ---------------- Test Cases ----------------
 
 func testSlabCreateAndDestroy(t *testing.T) {
-	a := SlabAllocatorCreate[testSlabStruct](128)
+	a := SlabAllocatorCreate[testSlabStruct](128, "")
 
 	mustNotPanic(t, func() { memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[testSlabStruct]](a) })
 
@@ -46,13 +46,13 @@ func testSlabCreateAndDestroy(t *testing.T) {
 
 func testSlabCreateWithZeroCapacityPanics(t *testing.T) {
 	mustPanic(t, func() {
-		SlabAllocatorCreate[testSlabStruct](0)
+		SlabAllocatorCreate[testSlabStruct](0, "")
 	})
 }
 
 func testSlabCreateWithZeroSlotSizePanics(t *testing.T) {
 	mustPanic(t, func() {
-		SlabAllocatorCreateWithSlotSize[testSlabStruct](8, 0, memcore.AlignOf[testSlabStruct]())
+		SlabAllocatorCreateWithSlotSize[testSlabStruct](8, 0, memcore.AlignOf[testSlabStruct](), "")
 	})
 }
 
@@ -60,7 +60,7 @@ func testSlabCreateWithCustomSlotSize(t *testing.T) {
 	const customSlotBytes uint64 = 256
 	align := memcore.AlignOf[testSlabStruct]()
 
-	a := SlabAllocatorCreateWithSlotSize[testSlabStruct](4, customSlotBytes, align)
+	a := SlabAllocatorCreateWithSlotSize[testSlabStruct](4, customSlotBytes, align, "")
 	defer SlabAllocatorDestroy[testSlabStruct](a)
 
 	if got := SlabAllocatorSlotSizeGet[testSlabStruct](a); got < customSlotBytes {
@@ -70,8 +70,8 @@ func testSlabCreateWithCustomSlotSize(t *testing.T) {
 	m1 := SlabAllocatorMalloc[testSlabStruct](a)
 	m2 := SlabAllocatorMalloc[testSlabStruct](a)
 
-	off1 := memcore.MemcoreMarkSubtractBaseOffset(m1, uintptr(memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[testSlabStruct]](a).dataBaseOffset))
-	off2 := memcore.MemcoreMarkSubtractBaseOffset(m2, uintptr(memcore.MemcoreMarkDereferenceObject[FixedSlabAllocator[testSlabStruct]](a).dataBaseOffset))
+	off1 := memcore.MemcoreMarkOffsetGet(m1)
+	off2 := memcore.MemcoreMarkOffsetGet(m2)
 	slotSize := SlabAllocatorSlotSizeGet[testSlabStruct](a)
 	if uint64(off2-off1) != slotSize {
 		t.Fatalf("slot spacing %d, want %d", off2-off1, slotSize)
@@ -90,7 +90,7 @@ func testSlabCreateWithCustomSlotSize(t *testing.T) {
 
 func testSlabMallocAndCallocObjects(t *testing.T) {
 	const capacity = 8
-	a := SlabAllocatorCreate[testSlabStruct](capacity)
+	a := SlabAllocatorCreate[testSlabStruct](capacity, "")
 	defer SlabAllocatorDestroy[testSlabStruct](a)
 
 	// 1. Allocate some objects with Malloc
@@ -126,7 +126,7 @@ func testSlabMallocAndCallocObjects(t *testing.T) {
 }
 
 func testSlabCallocZeroesMemory(t *testing.T) {
-	a := SlabAllocatorCreate[testSlabStruct](4)
+	a := SlabAllocatorCreate[testSlabStruct](4, "")
 	defer SlabAllocatorDestroy[testSlabStruct](a)
 
 	ptr := SlabAllocatorCalloc[testSlabStruct](a)
@@ -141,7 +141,7 @@ func testSlabCallocZeroesMemory(t *testing.T) {
 
 func testSlabAllocationExhaustionPanics(t *testing.T) {
 	const capacity = 4
-	a := SlabAllocatorCreate[testSlabStruct](capacity)
+	a := SlabAllocatorCreate[testSlabStruct](capacity, "")
 	defer SlabAllocatorDestroy[testSlabStruct](a)
 
 	// Allocate all available slots
@@ -161,7 +161,7 @@ func testSlabAllocationExhaustionPanics(t *testing.T) {
 
 func testSlabResetAllowsFullReuse(t *testing.T) {
 	const capacity = 8
-	a := SlabAllocatorCreate[testSlabStruct](capacity)
+	a := SlabAllocatorCreate[testSlabStruct](capacity, "")
 	defer SlabAllocatorDestroy[testSlabStruct](a)
 
 	ptrsBeforeReset := make([]memcore.MarkRaw, capacity)
@@ -193,7 +193,7 @@ func testSlabResetAllowsFullReuse(t *testing.T) {
 }
 
 func testSlabUnsafeFunctionsWork(t *testing.T) {
-	a := SlabAllocatorCreate[testSlabStruct](4)
+	a := SlabAllocatorCreate[testSlabStruct](4, "")
 	defer SlabAllocatorDestroy[testSlabStruct](a)
 
 	// Test unsafe malloc - verify we get non-nil memory

@@ -29,7 +29,9 @@ type MemforgeArenaSummary struct {
 	CreatedAt                time.Time
 	DestroyedAt              time.Time
 	LastAllocationAt         time.Time
-	AgeAtCapture             time.Duration
+	TimeAlive                time.Duration
+	OpaqueBacking            bool
+	Tag                      string
 	EverAllocations          int
 	LiveAllocations          int
 	PeakLiveAllocations      int
@@ -183,6 +185,8 @@ func MemforgeMemoryTimelineAnalyze(snapshot MemforgeMemoryTimelineSnapshot, filt
 					Name:                 evt.AllocatorName,
 					Address:              evt.AllocatorAddress,
 					CreatedAt:            evt.Timestamp,
+					OpaqueBacking:        evt.OpaqueBacking,
+					Tag:                  evt.Tag,
 					FilteredCreatorStack: MemforgeStackFilterApply(evt.Stack, filter),
 				},
 			}
@@ -248,7 +252,7 @@ func MemforgeMemoryTimelineAnalyze(snapshot MemforgeMemoryTimelineSnapshot, filt
 
 	analysis.Arenas = make([]MemforgeArenaSummary, 0, len(arenas))
 	for _, arena := range arenas {
-		arena.summary.AgeAtCapture = analysis.CapturedAt.Sub(arena.summary.CreatedAt)
+		arena.summary.TimeAlive = MemforgeArenaTimeAlive(arena.summary, analysis.CapturedAt)
 		arena.summary.Leaking = !arena.summary.Destroyed && arena.summary.LiveAllocations > 0
 		memforgeArenaSummaryComputeUtilization(&arena.summary)
 		analysis.Arenas = append(analysis.Arenas, arena.summary)
@@ -432,6 +436,24 @@ func memforgeMemoryTimelineAnalysisComputeUtilization(analysis *MemforgeMemoryTi
 	if totalPeakCap > 0 {
 		analysis.PeakUtilizationPercent = float64(analysis.TotalPeakLiveBytes) * 100 / float64(totalPeakCap)
 	}
+}
+
+/*
+MemforgeArenaTimeAlive returns how long an allocator existed at capture time.
+
+Destroyed arenas use DestroyedAt minus CreatedAt. Active arenas use capturedAt minus CreatedAt.
+*/
+func MemforgeArenaTimeAlive(arena MemforgeArenaSummary, capturedAt time.Time) time.Duration {
+	if arena.CreatedAt.IsZero() {
+		return 0
+	}
+	if arena.Destroyed && !arena.DestroyedAt.IsZero() {
+		return arena.DestroyedAt.Sub(arena.CreatedAt)
+	}
+	if capturedAt.IsZero() {
+		return time.Since(arena.CreatedAt)
+	}
+	return capturedAt.Sub(arena.CreatedAt)
 }
 
 func compareArenaSummaries(a, b MemforgeArenaSummary) int {

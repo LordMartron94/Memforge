@@ -243,6 +243,108 @@ func TestMemforgeMemoryTimelineAnalyzeDeterministicArenaOrder(t *testing.T) {
 	}
 }
 
+func TestMemforgeMemoryTimelineAnalyzeTimeAlive(t *testing.T) {
+	now := time.Now()
+	destroyedAt := now.Add(500 * time.Millisecond)
+	capturedAt := now.Add(2 * time.Second)
+
+	snapshot := MemforgeMemoryTimelineSnapshot{
+		Available:  true,
+		CapturedAt: capturedAt,
+		Events: []MemforgeTimelineEvent{
+			{
+				Seq:              1,
+				Timestamp:        now,
+				Kind:             MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress: 0x1000,
+				AllocatorName:    "active",
+			},
+			{
+				Seq:              2,
+				Timestamp:        now.Add(time.Millisecond),
+				Kind:             MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress: 0x2000,
+				AllocatorName:    "destroyed",
+			},
+			{
+				Seq:              3,
+				Timestamp:        destroyedAt,
+				Kind:             MemforgeTimelineEventAllocatorDestroy,
+				AllocatorAddress: 0x2000,
+				AllocatorName:    "destroyed",
+			},
+		},
+	}
+
+	analysis := MemforgeMemoryTimelineAnalyze(snapshot, MemforgeStackFilter{})
+	if len(analysis.Arenas) != 2 {
+		t.Fatalf("expected 2 arenas, got %d", len(analysis.Arenas))
+	}
+
+	var activeArena, destroyedArena MemforgeArenaSummary
+	for _, arena := range analysis.Arenas {
+		switch arena.Address {
+		case 0x1000:
+			activeArena = arena
+		case 0x2000:
+			destroyedArena = arena
+		}
+	}
+
+	if activeArena.TimeAlive != capturedAt.Sub(now) {
+		t.Fatalf("active arena time alive: got %s want %s", activeArena.TimeAlive, capturedAt.Sub(now))
+	}
+	if destroyedArena.TimeAlive != destroyedAt.Sub(now.Add(time.Millisecond)) {
+		t.Fatalf("destroyed arena time alive: got %s want %s", destroyedArena.TimeAlive, destroyedAt.Sub(now.Add(time.Millisecond)))
+	}
+	if !destroyedArena.DestroyedAt.Equal(destroyedAt) {
+		t.Fatalf("destroyed arena destroyedAt: got %v want %v", destroyedArena.DestroyedAt, destroyedAt)
+	}
+}
+
+func TestMemforgeMemoryTimelineAnalyzeOpaqueBacking(t *testing.T) {
+	now := time.Now()
+	snapshot := MemforgeMemoryTimelineSnapshot{
+		Available:  true,
+		CapturedAt: now.Add(time.Second),
+		Events: []MemforgeTimelineEvent{
+			{
+				Seq:              1,
+				Timestamp:        now,
+				Kind:             MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress: 0x1000,
+				AllocatorName:    "mappable",
+			},
+			{
+				Seq:              2,
+				Timestamp:        now,
+				Kind:             MemforgeTimelineEventAllocatorRegister,
+				AllocatorAddress: 0x2000,
+				AllocatorName:    "opaque",
+				OpaqueBacking:    true,
+			},
+		},
+	}
+
+	analysis := MemforgeMemoryTimelineAnalyze(snapshot, MemforgeStackFilter{})
+	if len(analysis.Arenas) != 2 {
+		t.Fatalf("expected 2 arenas, got %d", len(analysis.Arenas))
+	}
+
+	for _, arena := range analysis.Arenas {
+		switch arena.Address {
+		case 0x1000:
+			if arena.OpaqueBacking {
+				t.Fatalf("mappable arena marked opaque")
+			}
+		case 0x2000:
+			if !arena.OpaqueBacking {
+				t.Fatalf("opaque arena not marked opaque")
+			}
+		}
+	}
+}
+
 func TestMemforgeMemoryTimelineAnalyzeUtilizationMetrics(t *testing.T) {
 	now := time.Now()
 	snapshot := MemforgeMemoryTimelineSnapshot{
@@ -301,6 +403,7 @@ func TestMemforgeMemoryTimelineJSONLRoundTrip(t *testing.T) {
 				AllocatorAddress: 0x1000,
 				AllocatorName:    "arena-a",
 				Stack:            "app.CreateArena",
+				OpaqueBacking:    true,
 			},
 		},
 	}
@@ -319,5 +422,8 @@ func TestMemforgeMemoryTimelineJSONLRoundTrip(t *testing.T) {
 	}
 	if len(loaded.Events) != 1 || loaded.Events[0].AllocatorName != "arena-a" {
 		t.Fatalf("unexpected loaded snapshot: %+v", loaded)
+	}
+	if !loaded.Events[0].OpaqueBacking {
+		t.Fatalf("expected opaque_backing to round-trip")
 	}
 }

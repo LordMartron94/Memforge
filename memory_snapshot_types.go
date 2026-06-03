@@ -17,9 +17,13 @@ MemforgeAllocatorSnapshot records allocator-level telemetry captured at snapshot
 */
 type MemforgeAllocatorSnapshot struct {
 	Name                  string
+	Tag                   string
 	Address               uintptr
+	OpaqueBacking         bool
 	Destroyed             bool
 	CreatedAt             time.Time
+	DestroyedAt           time.Time
+	TimeAlive             time.Duration
 	Creator               string
 	TotalAllocations      int
 	LiveAllocations       int

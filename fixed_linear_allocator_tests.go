@@ -23,7 +23,7 @@ func TestLinearAllocator(t *testing.T) {
 
 func testCreateAndDestroy(t *testing.T) {
 	const sz = 4096
-	a := FixedLinearAllocatorCreate(sz)
+	a := FixedLinearAllocatorCreate(sz, "")
 	FixedLinearAllocatorDestroy(a)
 	mustPanic(t, func() { _ = FixedLinearAllocatorMalloc(a, 8, 8) })
 	mustPanic(t, func() { FixedLinearAllocatorReset(a) })
@@ -32,7 +32,7 @@ func testCreateAndDestroy(t *testing.T) {
 
 func testMallocAlignmentAndBump(t *testing.T) {
 	const sz = 1 << 16
-	a := FixedLinearAllocatorCreate(sz)
+	a := FixedLinearAllocatorCreate(sz, "")
 	defer FixedLinearAllocatorDestroy(a)
 
 	p1 := FixedLinearAllocatorMalloc(a, 24, 8)
@@ -54,7 +54,7 @@ func testMallocAlignmentAndBump(t *testing.T) {
 
 func testCapacityExhaustionPanics(t *testing.T) {
 	const sz = 256
-	a := FixedLinearAllocatorCreate(sz)
+	a := FixedLinearAllocatorCreate(sz, "")
 	defer FixedLinearAllocatorDestroy(a)
 
 	_ = FixedLinearAllocatorMalloc(a, 128, 8)
@@ -65,7 +65,7 @@ func testCapacityExhaustionPanics(t *testing.T) {
 
 func testZeroSizeAllocationNoBump(t *testing.T) {
 	const sz = 1024
-	a := FixedLinearAllocatorCreate(sz)
+	a := FixedLinearAllocatorCreate(sz, "")
 	defer FixedLinearAllocatorDestroy(a)
 
 	p0 := FixedLinearAllocatorMalloc(a, 0, 64)
@@ -78,7 +78,7 @@ func testZeroSizeAllocationNoBump(t *testing.T) {
 
 func testCallocZeroes(t *testing.T) {
 	const sz = 2048
-	a := FixedLinearAllocatorCreate(sz)
+	a := FixedLinearAllocatorCreate(sz, "")
 	defer FixedLinearAllocatorDestroy(a)
 
 	p := FixedLinearAllocatorCalloc(a, 128, 8)
@@ -92,7 +92,7 @@ func testCallocZeroes(t *testing.T) {
 
 func testResetAllowsReuse(t *testing.T) {
 	const sz = 4096
-	a := FixedLinearAllocatorCreate(sz)
+	a := FixedLinearAllocatorCreate(sz, "")
 	defer FixedLinearAllocatorDestroy(a)
 
 	p1 := FixedLinearAllocatorMalloc(a, 64, 32)
@@ -106,7 +106,7 @@ func testResetAllowsReuse(t *testing.T) {
 }
 
 func testInvalidAlignmentPanics(t *testing.T) {
-	a := FixedLinearAllocatorCreate(1024)
+	a := FixedLinearAllocatorCreate(1024, "")
 	defer FixedLinearAllocatorDestroy(a)
 	mustPanic(t, func() { _ = FixedLinearAllocatorMalloc(a, 8, 0) })
 	mustPanic(t, func() { _ = FixedLinearAllocatorMalloc(a, 8, 24) })
@@ -120,7 +120,7 @@ func testMallocAndCallocObject(t *testing.T) {
 		D byte
 	}
 
-	a := FixedLinearAllocatorCreate(4096)
+	a := FixedLinearAllocatorCreate(4096, "")
 	defer FixedLinearAllocatorDestroy(a)
 
 	_, obj := FixedLinearAllocatorMallocObject[pod](a)

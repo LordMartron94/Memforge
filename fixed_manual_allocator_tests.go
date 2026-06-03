@@ -19,7 +19,7 @@ func TestFixedManualAllocator(t *testing.T) {
 }
 
 func testManualCreateAndDestroy(t *testing.T) {
-	a := FixedManualAllocatorCreate(1024)
+	a := FixedManualAllocatorCreate(1024, "")
 
 	mustNotPanic(t, func() {
 		FixedManualAllocatorDestroy(a)
@@ -30,7 +30,7 @@ func testManualCreateAndDestroy(t *testing.T) {
 }
 
 func testManualMallocAlignmentAndBasicUse(t *testing.T) {
-	a := FixedManualAllocatorCreate(4096)
+	a := FixedManualAllocatorCreate(4096, "")
 	defer FixedManualAllocatorDestroy(a)
 
 	p1 := FixedManualAllocatorMalloc(a, 64, 8)
@@ -44,7 +44,7 @@ func testManualMallocAlignmentAndBasicUse(t *testing.T) {
 }
 
 func testManualCallocZeroes(t *testing.T) {
-	a := FixedManualAllocatorCreate(2048)
+	a := FixedManualAllocatorCreate(2048, "")
 	defer FixedManualAllocatorDestroy(a)
 
 	p := FixedManualAllocatorCalloc(a, 256, 16)
@@ -54,7 +54,7 @@ func testManualCallocZeroes(t *testing.T) {
 }
 
 func testManualFreeMergesAdjacentBlocks(t *testing.T) {
-	a := FixedManualAllocatorCreate(1024)
+	a := FixedManualAllocatorCreate(1024, "")
 	defer FixedManualAllocatorDestroy(a)
 
 	p1 := FixedManualAllocatorMalloc(a, 128, 8)
@@ -71,7 +71,7 @@ func testManualFreeMergesAdjacentBlocks(t *testing.T) {
 }
 
 func testManualFreeThenReallocate(t *testing.T) {
-	a := FixedManualAllocatorCreate(2048)
+	a := FixedManualAllocatorCreate(2048, "")
 	defer FixedManualAllocatorDestroy(a)
 
 	p1 := FixedManualAllocatorMalloc(a, 256, 16)
@@ -82,7 +82,7 @@ func testManualFreeThenReallocate(t *testing.T) {
 }
 
 func testManualResetRestoresFullFreeRegion(t *testing.T) {
-	a := FixedManualAllocatorCreate(2048)
+	a := FixedManualAllocatorCreate(2048, "")
 	defer FixedManualAllocatorDestroy(a)
 
 	_ = FixedManualAllocatorMalloc(a, 512, 8)
@@ -94,7 +94,7 @@ func testManualResetRestoresFullFreeRegion(t *testing.T) {
 }
 
 func testManualFragmentationMergePattern(t *testing.T) {
-	a := FixedManualAllocatorCreate(4096)
+	a := FixedManualAllocatorCreate(4096, "")
 	defer FixedManualAllocatorDestroy(a)
 
 	ptrs := make([]memcore.MarkRaw, 4)
@@ -113,7 +113,7 @@ func testManualFragmentationMergePattern(t *testing.T) {
 }
 
 func testManualInvalidAlignmentPanics(t *testing.T) {
-	a := FixedManualAllocatorCreate(1024)
+	a := FixedManualAllocatorCreate(1024, "")
 	defer FixedManualAllocatorDestroy(a)
 	mustPanic(t, func() { _ = FixedManualAllocatorMalloc(a, 8, 0) })
 	mustPanic(t, func() { _ = FixedManualAllocatorMalloc(a, 8, 24) })

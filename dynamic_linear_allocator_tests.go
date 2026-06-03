@@ -22,7 +22,7 @@ func TestDynamicLinearAllocator(t *testing.T) {
 
 func testDynamicCreateAndDestroy(t *testing.T) {
 	const sz = 4096
-	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests)
+	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests, "")
 	DynamicLinearAllocatorDestroy(a)
 
 	mustPanic(t, func() { _ = DynamicLinearAllocatorMalloc(a, 8, 8) })
@@ -31,7 +31,7 @@ func testDynamicCreateAndDestroy(t *testing.T) {
 
 func testDynamicMallocAlignmentAndBump(t *testing.T) {
 	const sz = 1 << 16
-	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests)
+	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests, "")
 	defer DynamicLinearAllocatorDestroy(a)
 
 	p1 := DynamicLinearAllocatorMalloc(a, 24, 8)
@@ -53,7 +53,7 @@ func testDynamicMallocAlignmentAndBump(t *testing.T) {
 
 func testDynamicZeroSizeAllocationNoBump(t *testing.T) {
 	const sz = 1024
-	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests)
+	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests, "")
 	defer DynamicLinearAllocatorDestroy(a)
 
 	p0 := DynamicLinearAllocatorMalloc(a, 0, 64)
@@ -66,7 +66,7 @@ func testDynamicZeroSizeAllocationNoBump(t *testing.T) {
 
 func testDynamicCallocZeroes(t *testing.T) {
 	const sz = 2048
-	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests)
+	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests, "")
 	defer DynamicLinearAllocatorDestroy(a)
 
 	const n = 128
@@ -80,7 +80,7 @@ func testDynamicCallocZeroes(t *testing.T) {
 
 func testDynamicResetAllowsReuse(t *testing.T) {
 	const sz = 4096
-	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests)
+	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests, "")
 	defer DynamicLinearAllocatorDestroy(a)
 
 	p1 := DynamicLinearAllocatorMalloc(a, 64, 32)
@@ -94,7 +94,7 @@ func testDynamicResetAllowsReuse(t *testing.T) {
 }
 
 func testDynamicInvalidAlignmentPanics(t *testing.T) {
-	a := DynamicLinearAllocatorCreate(1024, growthStrategyIDTests)
+	a := DynamicLinearAllocatorCreate(1024, growthStrategyIDTests, "")
 	defer DynamicLinearAllocatorDestroy(a)
 	mustPanic(t, func() { _ = DynamicLinearAllocatorMalloc(a, 8, 0) })
 	mustPanic(t, func() { _ = DynamicLinearAllocatorMalloc(a, 8, 24) })
@@ -108,7 +108,7 @@ func testDynamicMallocAndCallocObject(t *testing.T) {
 		D byte
 	}
 
-	a := DynamicLinearAllocatorCreate(4096, growthStrategyIDTests)
+	a := DynamicLinearAllocatorCreate(4096, growthStrategyIDTests, "")
 	defer DynamicLinearAllocatorDestroy(a)
 
 	_, obj := DynamicLinearAllocatorMallocObject[pod](a)
@@ -122,7 +122,7 @@ func testDynamicMallocAndCallocObject(t *testing.T) {
 
 func testDynamicGrowth(t *testing.T) {
 	const sz = 128
-	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests)
+	a := DynamicLinearAllocatorCreate(sz, growthStrategyIDTests, "")
 	defer DynamicLinearAllocatorDestroy(a)
 
 	p1 := DynamicLinearAllocatorMalloc(a, sz-16, 8)

@@ -54,6 +54,9 @@ type MemforgeTimelineEvent struct {
 	AllocatorName             string
 	Stack                     string
 	AllocationAddress         uintptr
+	AllocationRegionID        uint32
+	AllocationOffset          uint64
+	RootAllocationOffset      uint64
 	SizeBytes                 uint64
 	OriginalSeq               uint64
 	OriginalCreatedAt         time.Time
@@ -61,6 +64,8 @@ type MemforgeTimelineEvent struct {
 	ArenaDataCapBytes         uint64
 	ArenaTotalBytes           uint64
 	PreviousArenaDataCapBytes uint64
+	OpaqueBacking             bool
+	Tag                       string
 }
 
 /*
@@ -89,6 +94,7 @@ MemforgeMemoryDebugParams configures MemforgeMemoryDebugWithParams.
 Timeline.MaxEvents defaults to 0 (arena summary and leak groups only). Set MaxEvents > 0 to include a granular event listing.
 */
 type MemforgeMemoryDebugParams struct {
-	StackFilter MemforgeStackFilter
-	Timeline    MemforgeMemoryTimelineRenderParams
+	StackFilter         MemforgeStackFilter
+	SizingVerdictFilter MemforgeSizingVerdictFilter
+	Timeline            MemforgeMemoryTimelineRenderParams
 }

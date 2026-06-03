@@ -51,6 +51,9 @@ type timelineEvent struct {
 	allocatorName             string
 	stack                     string
 	allocationAddress         uintptr
+	allocationRegionID        uint32
+	allocationOffset          uint64
+	rootAllocationOffset      uint64
 	sizeBytes                 uint64
 	originalSeq               uint64
 	originalCreatedAt         time.Time
@@ -58,13 +61,18 @@ type timelineEvent struct {
 	arenaDataCapBytes         uint64
 	arenaTotalBytes           uint64
 	previousArenaDataCapBytes uint64
+	opaqueBacking             bool
+	tag                       string
 }
 
 type allocatorStats struct {
 	allocatorName                                        string
+	tag                                                  string
 	creator                                              string
+	opaqueBacking                                        bool
 	destroyed                                            bool
 	createdAt                                            time.Time
+	destroyedAt                                          time.Time
 	lastAllocAt                                          time.Time
 	allAllocations                                       []allocation
 	currentlyLiveAllocations                             []allocation
@@ -130,7 +138,37 @@ func timelineAllocatorAddress(allocatorPtr memcore.MarkRaw) uintptr {
 }
 
 func timelineAllocationAddress(allocationPtr memcore.MarkRaw) uintptr {
+	if memcore.MemcoreMarkRegionIsOpaque(allocationPtr) {
+		return 0
+	}
 	return uintptr(memcore.MemcoreMarkDereferenceUnsafe(allocationPtr))
+}
+
+func timelineAllocationRegionID(allocationPtr memcore.MarkRaw) uint32 {
+	return memcore.MemcoreMarkRegionIDGet(allocationPtr)
+}
+
+func timelineAllocationOffset(allocationPtr memcore.MarkRaw) uint64 {
+	return uint64(memcore.MemcoreMarkOffsetGet(allocationPtr))
+}
+
+func timelineAllocationRootOffset(allocationPtr memcore.MarkRaw) uint64 {
+	if !memcore.MemcoreMarkIsValid(allocationPtr) {
+		return 0
+	}
+
+	resolved := memcore.MemcoreMarkResolveToRoot(allocationPtr)
+	return uint64(memcore.MemcoreMarkOffsetGet(resolved))
+}
+
+func memforgeAddressFromMark(mark memcore.MarkRaw) uintptr {
+	if !memcore.MemcoreMarkIsValid(mark) {
+		return 0
+	}
+	if memcore.MemcoreMarkRegionIsOpaque(mark) {
+		return 0
+	}
+	return uintptr(memcore.MemcoreMarkDereference(mark))
 }
 
 func timelineFreedAllocationsFromLive(live []allocation) []MemforgeTimelineFreedAllocation {
@@ -140,7 +178,7 @@ func timelineFreedAllocationsFromLive(live []allocation) []MemforgeTimelineFreed
 	freed := make([]MemforgeTimelineFreedAllocation, len(live))
 	for i, entry := range live {
 		freed[i] = MemforgeTimelineFreedAllocation{
-			AllocationAddress: uintptr(memcore.MemcoreMarkDereferenceUnsafe(entry.ptr)),
+			AllocationAddress: timelineAllocationAddress(entry.ptr),
 			SizeBytes:         entry.sizeBytes,
 			OriginalSeq:       entry.seq,
 			OriginalCreatedAt: entry.timestamp,
@@ -150,9 +188,17 @@ func timelineFreedAllocationsFromLive(live []allocation) []MemforgeTimelineFreed
 }
 
 // Register a new allocator and record its creation site.
-func memforgeAllocatorRegister(allocatorPtr memcore.MarkRaw, name string, arenaDataCapBytes, arenaTotalBytes uint64) {
+func memforgeAllocatorRegister(
+	allocatorPtr memcore.MarkRaw,
+	name, tag string,
+	dataRegionID uint32,
+	arenaDataCapBytes, arenaTotalBytes uint64,
+) {
+	opaqueBacking := memcore.MemcoreRegionIsOpaque(dataRegionID)
 	debugStats[allocatorPtr] = &allocatorStats{
 		allocatorName: name,
+		tag:           tag,
+		opaqueBacking: opaqueBacking,
 		createdAt:     time.Now(),
 		creator:       memforgeCaptureCallStack(2),
 	}
@@ -160,7 +206,9 @@ func memforgeAllocatorRegister(allocatorPtr memcore.MarkRaw, name string, arenaD
 		kind:              MemforgeTimelineEventAllocatorRegister,
 		allocatorAddress:  timelineAllocatorAddress(allocatorPtr),
 		allocatorName:     name,
+		tag:               tag,
 		stack:             memforgeCaptureCallStack(2),
+		opaqueBacking:     opaqueBacking,
 		arenaDataCapBytes: arenaDataCapBytes,
 		arenaTotalBytes:   arenaTotalBytes,
 	})
@@ -211,12 +259,15 @@ func memforgeAllocationAdd(allocatorPtr, allocationPtr memcore.MarkRaw, sizeByte
 	}
 
 	appendTimelineEvent(timelineEvent{
-		kind:              MemforgeTimelineEventAllocation,
-		allocatorAddress:  timelineAllocatorAddress(allocatorPtr),
-		allocatorName:     stats.allocatorName,
-		stack:             creator,
-		allocationAddress: timelineAllocationAddress(allocationPtr),
-		sizeBytes:         sizeBytes,
+		kind:                 MemforgeTimelineEventAllocation,
+		allocatorAddress:     timelineAllocatorAddress(allocatorPtr),
+		allocatorName:        stats.allocatorName,
+		stack:                creator,
+		allocationAddress:    timelineAllocationAddress(allocationPtr),
+		allocationRegionID:   timelineAllocationRegionID(allocationPtr),
+		allocationOffset:     timelineAllocationOffset(allocationPtr),
+		rootAllocationOffset: timelineAllocationRootOffset(allocationPtr),
+		sizeBytes:            sizeBytes,
 	})
 	entry.seq = timelineSeq
 	stats.allAllocations[len(stats.allAllocations)-1] = entry
@@ -246,14 +297,17 @@ func memforgeAllocationRemove(allocatorPtr, allocationPtr memcore.MarkRaw) {
 	}
 
 	appendTimelineEvent(timelineEvent{
-		kind:              MemforgeTimelineEventFreeManual,
-		allocatorAddress:  timelineAllocatorAddress(allocatorPtr),
-		allocatorName:     stats.allocatorName,
-		stack:             memforgeCaptureCallStack(2),
-		allocationAddress: timelineAllocationAddress(allocationPtr),
-		sizeBytes:         removed.sizeBytes,
-		originalSeq:       removed.seq,
-		originalCreatedAt: removed.timestamp,
+		kind:                 MemforgeTimelineEventFreeManual,
+		allocatorAddress:     timelineAllocatorAddress(allocatorPtr),
+		allocatorName:        stats.allocatorName,
+		stack:                memforgeCaptureCallStack(2),
+		allocationAddress:    timelineAllocationAddress(allocationPtr),
+		allocationRegionID:   timelineAllocationRegionID(allocationPtr),
+		allocationOffset:     timelineAllocationOffset(allocationPtr),
+		rootAllocationOffset: timelineAllocationRootOffset(allocationPtr),
+		sizeBytes:            removed.sizeBytes,
+		originalSeq:          removed.seq,
+		originalCreatedAt:    removed.timestamp,
 	})
 }
 
@@ -285,6 +339,7 @@ func memforgeAllocatorDestroy(allocatorPtr memcore.MarkRaw) {
 	stats.currentlyLiveAllocations = nil
 	stats.liveBytes = 0
 	stats.destroyed = true
+	stats.destroyedAt = time.Now()
 }
 
 // Remove all allocations for an allocator.
@@ -328,7 +383,7 @@ func MemforgeMemorySnapshotGet() MemforgeMemorySnapshot {
 
 	allocators := make([]MemforgeAllocatorSnapshot, 0, len(debugStats))
 	for ptr, stats := range debugStats {
-		allocators = append(allocators, buildAllocatorSnapshot(ptr, stats))
+		allocators = append(allocators, buildAllocatorSnapshot(ptr, stats, snapshot.CapturedAt))
 	}
 	slices.SortFunc(allocators, func(a, b MemforgeAllocatorSnapshot) int {
 		switch {
@@ -364,13 +419,16 @@ func MemforgeMemorySnapshotGet() MemforgeMemorySnapshot {
 	return snapshot
 }
 
-func buildAllocatorSnapshot(ptr memcore.MarkRaw, stats *allocatorStats) MemforgeAllocatorSnapshot {
+func buildAllocatorSnapshot(ptr memcore.MarkRaw, stats *allocatorStats, capturedAt time.Time) MemforgeAllocatorSnapshot {
 	status, _, _ := allocatorStatusInfo(stats)
 	snapshot := MemforgeAllocatorSnapshot{
 		Name:                stats.allocatorName,
+		Tag:                 stats.tag,
 		Address:             memforgeAddressFromMark(ptr),
+		OpaqueBacking:       stats.opaqueBacking,
 		Destroyed:           stats.destroyed,
 		CreatedAt:           stats.createdAt,
+		DestroyedAt:         stats.destroyedAt,
 		Creator:             stats.creator,
 		TotalAllocations:    len(stats.allAllocations),
 		LiveAllocations:     len(stats.currentlyLiveAllocations),
@@ -381,6 +439,12 @@ func buildAllocatorSnapshot(ptr memcore.MarkRaw, stats *allocatorStats) Memforge
 		LastAllocationAt:    stats.lastAllocAt,
 		Status:              status,
 	}
+
+	snapshot.TimeAlive = MemforgeArenaTimeAlive(MemforgeArenaSummary{
+		CreatedAt:   snapshot.CreatedAt,
+		DestroyedAt: snapshot.DestroyedAt,
+		Destroyed:   snapshot.Destroyed,
+	}, capturedAt)
 
 	if snapshot.LiveAllocations > 0 {
 		snapshot.LiveAllocationDetails = buildLiveAllocationSnapshots(stats.currentlyLiveAllocations)
@@ -416,13 +480,6 @@ func buildLiveAllocationSnapshots(allocs []allocation) []MemforgeAllocationSnaps
 	return details
 }
 
-func memforgeAddressFromMark(mark memcore.MarkRaw) uintptr {
-	if !memcore.MemcoreMarkIsValid(mark) {
-		return 0
-	}
-	return uintptr(memcore.MemcoreMarkDereference(mark))
-}
-
 /*
 MemforgeMemoryDebug prints allocator usage and leaks using structured timeline analysis.
 */
@@ -435,10 +492,13 @@ MemforgeMemoryDebugWithParams prints timeline analysis with optional stack filte
 */
 func MemforgeMemoryDebugWithParams(params MemforgeMemoryDebugParams) {
 	snapshot := MemforgeMemoryTimelineSnapshotGet()
-	analysis := MemforgeMemoryTimelineAnalyze(snapshot, params.StackFilter)
-	memforgeMemoryAnalysisDebugPrint(analysis, params.Timeline, memforgeMemoryAnalysisPrintOptions{
-		title: "MEMFORGE MEMORY DEBUGGER",
-	})
+	filter := params.StackFilter
+	if filter.MaxDepth == 0 && len(filter.IgnoreContains) == 0 && len(filter.IgnorePrefixes) == 0 {
+		filter = MemforgeDebuggerDefaultStackFilter()
+	}
+	analysis := MemforgeMemoryTimelineAnalyze(snapshot, filter)
+	report := MemforgeMemoryProfileAnalyze(analysis, filter, params.SizingVerdictFilter)
+	memforgeMemorySystemReportDebugPrint(report, analysis, params.Timeline)
 }
 
 type memforgeMemoryAnalysisPrintOptions struct {
@@ -530,12 +590,17 @@ func timelineEventToPublic(evt timelineEvent) MemforgeTimelineEvent {
 		AllocatorName:             evt.allocatorName,
 		Stack:                     evt.stack,
 		AllocationAddress:         evt.allocationAddress,
+		AllocationRegionID:        evt.allocationRegionID,
+		AllocationOffset:          evt.allocationOffset,
+		RootAllocationOffset:      evt.rootAllocationOffset,
 		SizeBytes:                 evt.sizeBytes,
 		OriginalSeq:               evt.originalSeq,
 		OriginalCreatedAt:         evt.originalCreatedAt,
 		ArenaDataCapBytes:         evt.arenaDataCapBytes,
 		ArenaTotalBytes:           evt.arenaTotalBytes,
 		PreviousArenaDataCapBytes: evt.previousArenaDataCapBytes,
+		OpaqueBacking:             evt.opaqueBacking,
+		Tag:                       evt.tag,
 	}
 	if len(evt.freedAllocations) > 0 {
 		out.FreedAllocations = slices.Clone(evt.freedAllocations)
@@ -548,11 +613,122 @@ MemforgeMemoryTimelineDebug prints an arena-focused analysis of the recorded tim
 */
 func MemforgeMemoryTimelineDebug(params MemforgeMemoryTimelineRenderParams) {
 	snapshot := MemforgeMemoryTimelineSnapshotGet()
-	analysis := MemforgeMemoryTimelineAnalyze(snapshot, MemforgeStackFilter{})
-	memforgeMemoryAnalysisDebugPrint(analysis, params, memforgeMemoryAnalysisPrintOptions{
-		title:              "MEMFORGE MEMORY ANALYSIS",
-		showEventKindLines: true,
-	})
+	filter := MemforgeDebuggerDefaultStackFilter()
+	analysis := MemforgeMemoryTimelineAnalyze(snapshot, filter)
+	report := MemforgeMemoryProfileAnalyze(analysis, filter, MemforgeSizingVerdictFilter{})
+	memforgeMemorySystemReportDebugPrint(report, analysis, params)
+}
+
+func memforgeMemorySystemReportDebugPrint(report MemforgeMemorySystemReport, analysis MemforgeMemoryTimelineAnalysis, params MemforgeMemoryTimelineRenderParams) {
+	if report.LeakDetected {
+		memforgeMemoryAnalysisDebugPrint(analysis, params, memforgeMemoryAnalysisPrintOptions{
+			title:              "MEMFORGE MEMORY DEBUGGER (Leaks Detected)",
+			showEventKindLines: true,
+		})
+		reportTitle := "ALLOCATION PROFILE (Aggregated)"
+		memforgeMemoryProfileReportDebugPrint(report, reportTitle, false)
+		return
+	}
+
+	memforgeMemoryProfileReportDebugPrint(report, "MEMFORGE MEMORY SYSTEM REPORT (No Leaks)", true)
+	if params.MaxEvents != 0 {
+		fmt.Printf("%s\nGranular Timeline:%s\n", colorBoldYellow, colorReset)
+		limit := len(analysis.Events)
+		if params.MaxEvents > 0 && params.MaxEvents < limit {
+			limit = params.MaxEvents
+		}
+		for i := 0; i < limit; i++ {
+			writeTimelineEventLine(&analysis.Events[i], params.ExpandRegionalFreed)
+		}
+		if limit < len(analysis.Events) {
+			fmt.Printf("%s... %d more events not shown%s\n", colorGray, len(analysis.Events)-limit, colorReset)
+		}
+	}
+	fmt.Println()
+}
+
+func memforgeMemoryProfileReportDebugPrint(report MemforgeMemorySystemReport, title string, includeVerdict bool) {
+	fmt.Printf("\n%s=== %s ===%s\n", colorBoldCyan, title, colorReset)
+	if !report.Available {
+		fmt.Printf("%s(unavailable — rebuild with -tags memforge_debug)%s\n\n", colorYellow, colorReset)
+		return
+	}
+	if report.TotalEvents == 0 && report.TotalArenas == 0 {
+		fmt.Printf("%s🧩 No allocators registered%s\n\n", colorYellow, colorReset)
+		return
+	}
+
+	totalCap := report.TotalMappableCapBytes + report.TotalOpaqueCapBytes
+	highWater := report.GlobalCapacityHighWaterBytes
+	if highWater == 0 {
+		highWater = totalCap
+	}
+
+	fmt.Printf("%sTelemetry  :%s %d Events | %d Total Arenas (%s%d Active%s)\n",
+		colorWhite, colorReset,
+		report.TotalEvents, report.TotalArenas,
+		colorGreen, report.ActiveArenas, colorReset)
+	fmt.Printf("%sTotal Cap  :%s %s %s[Mappable: %s | Opaque: %s]%s\n",
+		colorWhite, colorReset, humanBytes(float64(totalCap)), colorGray,
+		humanBytes(float64(report.TotalMappableCapBytes)),
+		humanBytes(float64(report.TotalOpaqueCapBytes)),
+		colorReset)
+	fmt.Printf("%sPeak Load  :%s %d Allocations | %s Global Peak\n",
+		colorWhite, colorReset,
+		report.GlobalPeakLiveAllocations,
+		humanBytes(float64(report.GlobalPeakLiveBytes)))
+	fmt.Printf("%sHigh-Water :%s Global Arena Capacity Peak: %s\n",
+		colorWhite, colorReset, humanBytes(float64(highWater)))
+
+	if len(report.Buckets) > 0 {
+		fmt.Printf("\n%sCategorized Allocation Profile (Aggregated by Call Site):%s\n", colorBoldYellow, colorReset)
+		for _, bucket := range report.Buckets {
+			memforgeProfileBucketDebugPrint(bucket)
+		}
+	}
+
+	if includeVerdict && len(report.SizingVerdicts) > 0 {
+		fmt.Printf("\n%sSizing Efficiency Verdict:%s\n", colorBoldYellow, colorReset)
+		for _, verdict := range report.SizingVerdicts {
+			color := colorYellow
+			if verdict.Kind == MemforgeSizingVerdictOverutilized {
+				color = colorBoldRed
+			}
+			fmt.Printf("  %s%s%s\n", color, verdict.Message, colorReset)
+		}
+		if len(report.SizingVerdicts) > 0 {
+			fmt.Printf("  %sSTRATEGY:%s Review preset slab sizes for buckets flagged above.\n", colorBoldCyan, colorReset)
+		}
+	}
+}
+
+func memforgeProfileBucketDebugPrint(bucket MemforgeArenaProfileBucket) {
+	backingLabel := "Mappable"
+	if bucket.OpaqueBacking {
+		backingLabel = "Opaque"
+	}
+
+	fmt.Printf("\n%s[%s]%s %s (x%d Arena", colorGray, backingLabel, colorReset, bucket.DisplayLabel, bucket.InstanceCount)
+	if bucket.InstanceCount != 1 {
+		fmt.Print("s")
+	}
+	fmt.Println(")")
+	fmt.Printf("  %sInstances:%s %d spawned, %d destroyed, %d active",
+		colorWhite, colorReset,
+		bucket.InstanceCount, bucket.DestroyedCount, bucket.ActiveCount)
+	if bucket.MaxConcurrentActive > 1 {
+		fmt.Printf("  %s(concurrent high-water: %d)%s", colorGray, bucket.MaxConcurrentActive, colorReset)
+	}
+	fmt.Println()
+	fmt.Printf("  %sSizing   :%s Configured: %s | Max Peak Util: %s (%.1f%%) | Ever Alloc: %s\n",
+		colorWhite, colorReset,
+		humanBytes(float64(bucket.ConfiguredCapBytes)),
+		humanBytes(float64(bucket.MaxPeakBytes)),
+		bucket.MaxPeakUtilPercent,
+		humanBytes(float64(bucket.TotalEverBytes)))
+	if bucket.SiteLine != "" {
+		fmt.Printf("  %sSite     :%s %s%s%s\n", colorWhite, colorReset, colorCyan, bucket.SiteLine, colorReset)
+	}
 }
 
 func memforgeMemoryAnalysisDebugPrint(analysis MemforgeMemoryTimelineAnalysis, params MemforgeMemoryTimelineRenderParams, opts memforgeMemoryAnalysisPrintOptions) {
@@ -572,7 +748,7 @@ func memforgeMemoryAnalysisDebugPrint(analysis MemforgeMemoryTimelineAnalysis, p
 	}
 
 	memforgeMemoryAnalysisSummaryDebugPrint(analysis, opts.showEventKindLines)
-	memforgeArenaSummaryDebugPrint(analysis.Arenas, analysis.CapturedAt)
+	memforgeLeakingArenaSummaryDebugPrint(analysis.Arenas, analysis.CapturedAt)
 
 	if analysis.TotalLiveAllocations > 0 {
 		fmt.Printf("%s\nLeak Groups (by filtered stack):%s\n", colorBoldYellow, colorReset)
@@ -618,8 +794,9 @@ func memforgeMemoryAnalysisSummaryDebugPrint(analysis MemforgeMemoryTimelineAnal
 		humanBytes(float64(analysis.TotalEverBytes)))
 	if analysis.TotalArenaDataCapBytes > 0 {
 		fmt.Printf("%sArena cap :%s %s", colorWhite, colorReset, humanBytes(float64(analysis.TotalArenaDataCapBytes)))
-		if analysis.TotalArenaMmapBytes > 0 {
-			fmt.Printf("  %sMmap:%s %s", colorWhite, colorReset, humanBytes(float64(analysis.TotalArenaMmapBytes)))
+		mappableMmap := memforgeAnalysisMappableMmapBytes(analysis.Arenas)
+		if mappableMmap > 0 {
+			fmt.Printf("  %sMmap:%s %s", colorWhite, colorReset, humanBytes(float64(mappableMmap)))
 		}
 		fmt.Println()
 		fmt.Printf("%sUtil      :%s live %.1f%%  peak %.1f%%  ever %.1f%%\n",
@@ -640,6 +817,16 @@ func memforgeMemoryAnalysisSummaryDebugPrint(analysis MemforgeMemoryTimelineAnal
 		fmt.Printf("%sNo leaks detected%s\n", colorBoldGreen, colorReset)
 	}
 	fmt.Println()
+}
+
+func memforgeAnalysisMappableMmapBytes(arenas []MemforgeArenaSummary) uint64 {
+	var total uint64
+	for _, arena := range arenas {
+		if !arena.OpaqueBacking {
+			total += arena.CurrentArenaTotalBytes
+		}
+	}
+	return total
 }
 
 func memforgeMemoryAnalysisEventKindsDebugPrint(events []MemforgeTimelineEvent) {
@@ -673,28 +860,75 @@ func memforgeMemoryAnalysisEventKindsDebugPrint(events []MemforgeTimelineEvent) 
 	}
 }
 
-func memforgeArenaSummaryDebugPrint(arenas []MemforgeArenaSummary, capturedAt time.Time) {
-	fmt.Printf("%s\nArena Summary:%s\n", colorBoldYellow, colorReset)
+func memforgeLeakingArenaSummaryDebugPrint(arenas []MemforgeArenaSummary, capturedAt time.Time) {
+	leaking := make([]MemforgeArenaSummary, 0)
 	for _, arena := range arenas {
-		leakColor := colorGreen
-		leakLabel := "OK"
 		if arena.Leaking {
-			leakColor = colorBoldRed
-			leakLabel = "LEAKING"
+			leaking = append(leaking, arena)
 		}
-		fmt.Printf("  %s%s%s %s (%s)\n", leakColor, leakLabel, colorReset, arena.Name, formatTimelineAddress(arena.Address))
-		fmt.Printf("    created=%s\n", memforgeFormatDebugTimestamp(arena.CreatedAt, capturedAt))
-		fmt.Printf("    last alloc=%s\n", memforgeFormatDebugTimestamp(arena.LastAllocationAt, capturedAt))
-		fmt.Printf("    age=%s live=%d/%s peak=%d/%s ever=%d/%s\n",
-			formatDuration(arena.AgeAtCapture),
-			arena.LiveAllocations, humanBytes(float64(arena.LiveBytes)),
-			arena.PeakLiveAllocations, humanBytes(float64(arena.PeakLiveBytes)),
-			arena.EverAllocations, humanBytes(float64(arena.EverBytes)))
-		memforgeArenaCapacityDebugPrint(arena)
-		memforgeArenaUtilizationDebugPrint(arena)
-		if len(arena.FilteredCreatorStack) > 0 {
-			fmt.Printf("    created by: %s%s%s\n", colorCyan, strings.Join(arena.FilteredCreatorStack, " → "), colorReset)
+	}
+	if len(leaking) == 0 {
+		return
+	}
+
+	fmt.Printf("%s\nLeaking Arenas:%s\n", colorBoldRed, colorReset)
+	for _, arena := range leaking {
+		memforgeArenaSummaryEntryDebugPrint(arena, capturedAt)
+	}
+}
+
+func memforgeArenaSummaryDebugPrint(arenas []MemforgeArenaSummary, capturedAt time.Time) {
+	mappable := make([]MemforgeArenaSummary, 0, len(arenas))
+	opaque := make([]MemforgeArenaSummary, 0, len(arenas))
+	for _, arena := range arenas {
+		if arena.OpaqueBacking {
+			opaque = append(opaque, arena)
+		} else {
+			mappable = append(mappable, arena)
 		}
+	}
+
+	memforgeArenaSummarySectionDebugPrint("Arena Summary (Mappable backing):", mappable, capturedAt)
+	memforgeArenaSummarySectionDebugPrint("Arena Summary (Opaque backing):", opaque, capturedAt)
+}
+
+func memforgeArenaSummarySectionDebugPrint(title string, arenas []MemforgeArenaSummary, capturedAt time.Time) {
+	if len(arenas) == 0 {
+		return
+	}
+
+	fmt.Printf("%s\n%s:%s\n", colorBoldYellow, title, colorReset)
+	for _, arena := range arenas {
+		memforgeArenaSummaryEntryDebugPrint(arena, capturedAt)
+	}
+}
+
+func memforgeArenaSummaryEntryDebugPrint(arena MemforgeArenaSummary, capturedAt time.Time) {
+	leakColor := colorGreen
+	leakLabel := "OK"
+	if arena.Leaking {
+		leakColor = colorBoldRed
+		leakLabel = "LEAKING"
+	}
+	statusSuffix := ""
+	if arena.Destroyed {
+		statusSuffix = " destroyed"
+	}
+	fmt.Printf("  %s%s%s %s (%s)%s\n", leakColor, leakLabel, colorReset, arena.Name, formatTimelineAddress(arena.Address), statusSuffix)
+	fmt.Printf("    created=%s\n", memforgeFormatDebugTimestamp(arena.CreatedAt, capturedAt))
+	if arena.Destroyed {
+		fmt.Printf("    destroyed=%s\n", memforgeFormatDebugTimestamp(arena.DestroyedAt, capturedAt))
+	}
+	fmt.Printf("    alive=%s\n", formatDuration(arena.TimeAlive))
+	fmt.Printf("    last alloc=%s\n", memforgeFormatDebugTimestamp(arena.LastAllocationAt, capturedAt))
+	fmt.Printf("    live=%d/%s peak=%d/%s ever=%d/%s\n",
+		arena.LiveAllocations, humanBytes(float64(arena.LiveBytes)),
+		arena.PeakLiveAllocations, humanBytes(float64(arena.PeakLiveBytes)),
+		arena.EverAllocations, humanBytes(float64(arena.EverBytes)))
+	memforgeArenaCapacityDebugPrint(arena)
+	memforgeArenaUtilizationDebugPrint(arena)
+	if len(arena.FilteredCreatorStack) > 0 {
+		fmt.Printf("    created by: %s%s%s\n", colorCyan, strings.Join(arena.FilteredCreatorStack, " → "), colorReset)
 	}
 }
 
@@ -731,7 +965,7 @@ func memforgeArenaCapacityDebugPrint(arena MemforgeArenaSummary) {
 	}
 
 	line := fmt.Sprintf("    %sArena:%s %s", colorWhite, colorReset, humanBytes(float64(arena.CurrentArenaDataCapBytes)))
-	if arena.CurrentArenaTotalBytes > 0 {
+	if !arena.OpaqueBacking && arena.CurrentArenaTotalBytes > 0 {
 		line += fmt.Sprintf("  %sMmap:%s %s", colorWhite, colorReset, humanBytes(float64(arena.CurrentArenaTotalBytes)))
 	}
 	if peakCap > arena.CurrentArenaDataCapBytes {
@@ -784,6 +1018,13 @@ func writeTimelineEventLine(evt *MemforgeTimelineEvent, expandRegional bool) {
 
 	switch evt.Kind {
 	case MemforgeTimelineEventAllocatorRegister, MemforgeTimelineEventAllocatorGrow:
+		if evt.Kind == MemforgeTimelineEventAllocatorRegister {
+			backingLabel := "mappable"
+			if evt.OpaqueBacking {
+				backingLabel = "opaque"
+			}
+			fmt.Printf("  %sBacking:%s %s\n", colorWhite, colorReset, backingLabel)
+		}
 		if evt.ArenaDataCapBytes > 0 {
 			line := fmt.Sprintf("  %sArena data cap:%s %s", colorWhite, colorReset, humanBytes(float64(evt.ArenaDataCapBytes)))
 			if evt.ArenaTotalBytes > 0 {
@@ -795,9 +1036,15 @@ func writeTimelineEventLine(evt *MemforgeTimelineEvent, expandRegional bool) {
 			fmt.Println(line)
 		}
 	case MemforgeTimelineEventAllocation, MemforgeTimelineEventFreeManual:
-		fmt.Printf("  %sAddress:%s %s  %sSize:%s %s\n",
-			colorWhite, colorReset, formatTimelineAddress(evt.AllocationAddress),
-			colorWhite, colorReset, humanBytes(float64(evt.SizeBytes)))
+		if evt.AllocationAddress != 0 {
+			fmt.Printf("  %sAddress:%s %s  %sSize:%s %s\n",
+				colorWhite, colorReset, formatTimelineAddress(evt.AllocationAddress),
+				colorWhite, colorReset, humanBytes(float64(evt.SizeBytes)))
+		} else if evt.AllocationRegionID != 0 {
+			fmt.Printf("  %sOpaque:%s region=%d offset=0x%x  %sSize:%s %s\n",
+				colorWhite, colorReset, evt.AllocationRegionID, evt.AllocationOffset,
+				colorWhite, colorReset, humanBytes(float64(evt.SizeBytes)))
+		}
 		if evt.Kind == MemforgeTimelineEventFreeManual {
 			fmt.Printf("  %sOrig:#%d%s at %s\n",
 				colorGray, evt.OriginalSeq, colorReset, evt.OriginalCreatedAt.Format("15:04:05.000"))

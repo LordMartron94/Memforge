@@ -80,7 +80,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 				func(b *testing.B) benchData {
 					old := debug.SetGCPercent(-1)
 					const arenaSize = 8 * 1024 * 1024
-					a := FixedLinearAllocatorCreate(arenaSize)
+					a := FixedLinearAllocatorCreate(arenaSize, "")
 					return benchData{
 						allocator:    a,
 						counter:      0,
@@ -122,7 +122,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 					old := debug.SetGCPercent(-1)
 					const initialSize = 1 * 1024 * 1024
 					const maxArenaSize = 8 * 1024 * 1024
-					a := DynamicLinearAllocatorCreate(uint64(initialSize), growthStrategyID)
+					a := DynamicLinearAllocatorCreate(uint64(initialSize), growthStrategyID, "")
 					return benchData{allocator: a, counter: 0, limit: maxArenaSize / size, oldGCPercent: old}
 				},
 				func(d benchData, b *testing.B) {
@@ -158,7 +158,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 				func(b *testing.B) benchData {
 					old := debug.SetGCPercent(-1)
 					const arenaSize = 8 * 1024 * 1024
-					a := FixedManualAllocatorCreate(uint64(arenaSize))
+					a := FixedManualAllocatorCreate(uint64(arenaSize), "")
 					return benchData{allocator: a, counter: 0, limit: arenaSize / size, oldGCPercent: old}
 				},
 				func(d benchData, b *testing.B) {
@@ -196,7 +196,7 @@ func BenchmarkAllocatorSuite_Comparison(b *testing.B) {
 					func(b *testing.B) benchData {
 						old := debug.SetGCPercent(-1)
 						const capacity = 10000
-						a := SlabAllocatorCreate[Block](capacity)
+						a := SlabAllocatorCreate[Block](capacity, "")
 						return benchData{
 							allocator:    a,
 							ptrs:         make([]memcore.MarkRaw, 0, capacity),
@@ -265,7 +265,7 @@ func BenchmarkAllocatorSuite_RealisticWorkloads(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedLinearAllocatorCreate(1 * 1024 * 1024)
+				a := FixedLinearAllocatorCreate(1*1024*1024, "")
 				return benchData{allocator: a, oldGC: old}
 			},
 			func(d benchData, b *testing.B) {
@@ -293,7 +293,7 @@ func BenchmarkAllocatorSuite_RealisticWorkloads(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := DynamicLinearAllocatorCreate(128*1024, growthStrategyID)
+				a := DynamicLinearAllocatorCreate(128*1024, growthStrategyID, "")
 				return benchData{allocator: a, oldGC: old}
 			},
 			func(d benchData, b *testing.B) {
@@ -321,7 +321,7 @@ func BenchmarkAllocatorSuite_RealisticWorkloads(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedManualAllocatorCreate(1 * 1024 * 1024)
+				a := FixedManualAllocatorCreate(1*1024*1024, "")
 				return benchData{allocator: a, oldGC: old}
 			},
 			func(d benchData, b *testing.B) {
@@ -375,7 +375,7 @@ func BenchmarkAllocatorSuite_MixedSizeWorkload(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedLinearAllocatorCreate(arenaSize)
+				a := FixedLinearAllocatorCreate(arenaSize, "")
 				return benchData{allocator: a, oldGC: old}
 			},
 			func(d benchData, b *testing.B) {
@@ -412,7 +412,7 @@ func BenchmarkAllocatorSuite_MixedSizeWorkload(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedManualAllocatorCreate(arenaSize)
+				a := FixedManualAllocatorCreate(arenaSize, "")
 				return benchData{allocator: a, oldGC: old}
 			},
 			func(d benchData, b *testing.B) {
@@ -458,7 +458,7 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedManualAllocatorCreate(arenaSize)
+				a := FixedManualAllocatorCreate(arenaSize, "")
 				ptrs := make([]memcore.MarkRaw, poolSize)
 				for i := range ptrs {
 					ptrs[i] = FixedManualAllocatorMalloc(a, objSize, 16)
@@ -493,7 +493,7 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedManualAllocatorCreate(arenaSize)
+				a := FixedManualAllocatorCreate(arenaSize, "")
 				return benchData{allocator: a, oldGC: old}
 			},
 			func(d benchData, b *testing.B) {
@@ -528,7 +528,7 @@ func BenchmarkAllocatorSuite_Fragmentation(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedManualAllocatorCreate(arenaSize)
+				a := FixedManualAllocatorCreate(arenaSize, "")
 				return benchData{
 					allocator: a,
 					ptrs:      make([]memcore.MarkRaw, ops),
@@ -572,7 +572,7 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 			benchmarking.BenchmarkWithMetrics(b,
 				func(b *testing.B) benchData {
 					old := debug.SetGCPercent(-1)
-					a := FixedManualAllocatorCreate(8 * 1024 * 1024)
+					a := FixedManualAllocatorCreate(8*1024*1024, "")
 					return benchData{allocator: a, oldGC: old}
 				},
 				func(d benchData, b *testing.B) {
@@ -602,7 +602,7 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedManualAllocatorCreate(8 * 1024 * 1024)
+				a := FixedManualAllocatorCreate(8*1024*1024, "")
 				return benchData{
 					allocator:  a,
 					oldGC:      old,
@@ -638,7 +638,7 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedManualAllocatorCreate(2 * 1024 * 1024)
+				a := FixedManualAllocatorCreate(2*1024*1024, "")
 				ptrs := make([]memcore.MarkRaw, allocsPerCycle)
 				return benchData{allocator: a, oldGC: old, ptrs: ptrs}
 			},
@@ -674,7 +674,7 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedManualAllocatorCreate(8 * 1024 * 1024)
+				a := FixedManualAllocatorCreate(8*1024*1024, "")
 				ptrs := make([]memcore.MarkRaw, preAllocCount)
 				for i := range ptrs {
 					ptrs[i] = FixedManualAllocatorMalloc(a, blockSize, 16)
@@ -715,7 +715,7 @@ func BenchmarkFixedManualAllocator_Suite(b *testing.B) {
 		benchmarking.BenchmarkWithMetrics(b,
 			func(b *testing.B) benchData {
 				old := debug.SetGCPercent(-1)
-				a := FixedManualAllocatorCreate(arenaSize)
+				a := FixedManualAllocatorCreate(arenaSize, "")
 				return benchData{allocator: a, oldGC: old}
 			},
 			func(d benchData, b *testing.B) {
