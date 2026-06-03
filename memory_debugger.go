@@ -498,7 +498,7 @@ func MemforgeMemoryDebugWithParams(params MemforgeMemoryDebugParams) {
 	}
 	analysis := MemforgeMemoryTimelineAnalyze(snapshot, filter)
 	report := MemforgeMemoryProfileAnalyze(analysis, filter, params.SizingVerdictFilter)
-	memforgeMemorySystemReportDebugPrint(report, analysis, params.Timeline)
+	memforgeMemorySystemReportDebugPrint(report, analysis, params.Timeline, params.DomainGroups)
 }
 
 type memforgeMemoryAnalysisPrintOptions struct {
@@ -616,21 +616,26 @@ func MemforgeMemoryTimelineDebug(params MemforgeMemoryTimelineRenderParams) {
 	filter := MemforgeDebuggerDefaultStackFilter()
 	analysis := MemforgeMemoryTimelineAnalyze(snapshot, filter)
 	report := MemforgeMemoryProfileAnalyze(analysis, filter, MemforgeSizingVerdictFilter{})
-	memforgeMemorySystemReportDebugPrint(report, analysis, params)
+	memforgeMemorySystemReportDebugPrint(report, analysis, params, nil)
 }
 
-func memforgeMemorySystemReportDebugPrint(report MemforgeMemorySystemReport, analysis MemforgeMemoryTimelineAnalysis, params MemforgeMemoryTimelineRenderParams) {
+func memforgeMemorySystemReportDebugPrint(
+	report MemforgeMemorySystemReport,
+	analysis MemforgeMemoryTimelineAnalysis,
+	params MemforgeMemoryTimelineRenderParams,
+	domainGroups map[string][]string,
+) {
 	if report.LeakDetected {
 		memforgeMemoryAnalysisDebugPrint(analysis, params, memforgeMemoryAnalysisPrintOptions{
 			title:              "MEMFORGE MEMORY DEBUGGER (Leaks Detected)",
 			showEventKindLines: true,
 		})
 		reportTitle := "ALLOCATION PROFILE (Aggregated)"
-		memforgeMemoryProfileReportDebugPrint(report, reportTitle, false)
+		memforgeMemoryProfileReportDebugPrint(report, reportTitle, false, domainGroups)
 		return
 	}
 
-	memforgeMemoryProfileReportDebugPrint(report, "MEMFORGE MEMORY SYSTEM REPORT (No Leaks)", true)
+	memforgeMemoryProfileReportDebugPrint(report, "MEMFORGE MEMORY SYSTEM REPORT (No Leaks)", true, domainGroups)
 	if params.MaxEvents != 0 {
 		fmt.Printf("%s\nGranular Timeline:%s\n", colorBoldYellow, colorReset)
 		limit := len(analysis.Events)
@@ -647,7 +652,12 @@ func memforgeMemorySystemReportDebugPrint(report MemforgeMemorySystemReport, ana
 	fmt.Println()
 }
 
-func memforgeMemoryProfileReportDebugPrint(report MemforgeMemorySystemReport, title string, includeVerdict bool) {
+func memforgeMemoryProfileReportDebugPrint(
+	report MemforgeMemorySystemReport,
+	title string,
+	includeVerdict bool,
+	domainGroups map[string][]string,
+) {
 	fmt.Printf("\n%s=== %s ===%s\n", colorBoldCyan, title, colorReset)
 	if !report.Available {
 		fmt.Printf("%s(unavailable — rebuild with -tags memforge_debug)%s\n\n", colorYellow, colorReset)
@@ -681,10 +691,7 @@ func memforgeMemoryProfileReportDebugPrint(report MemforgeMemorySystemReport, ti
 		colorWhite, colorReset, humanBytes(float64(highWater)))
 
 	if len(report.Buckets) > 0 {
-		fmt.Printf("\n%sCategorized Allocation Profile (Aggregated by Call Site):%s\n", colorBoldYellow, colorReset)
-		for _, bucket := range report.Buckets {
-			memforgeProfileBucketDebugPrint(bucket)
-		}
+		memforgeProfileBucketsDebugPrint(report.Buckets, domainGroups)
 	}
 
 	if includeVerdict && len(report.SizingVerdicts) > 0 {
@@ -700,6 +707,60 @@ func memforgeMemoryProfileReportDebugPrint(report MemforgeMemorySystemReport, ti
 			fmt.Printf("  %sSTRATEGY:%s Review preset slab sizes for buckets flagged above.\n", colorBoldCyan, colorReset)
 		}
 	}
+}
+
+func memforgeProfileBucketsDebugPrint(buckets []MemforgeArenaProfileBucket, domainGroups map[string][]string) {
+	grouped, ungrouped := MemforgeDomainGroupBuckets(buckets, domainGroups)
+	if grouped == nil {
+		fmt.Printf("\n%sCategorized Allocation Profile (Aggregated by Call Site):%s\n", colorBoldYellow, colorReset)
+		for _, bucket := range buckets {
+			memforgeProfileBucketDebugPrint(bucket)
+		}
+		return
+	}
+
+	fmt.Printf("\n%sAllocation Profile by Domain:%s\n", colorBoldYellow, colorReset)
+	for _, domain := range memforgeDomainGroupsSortedNames(domainGroups) {
+		domainBuckets := grouped[domain]
+		if len(domainBuckets) == 0 {
+			continue
+		}
+		fmt.Printf("\n%s  %s%s\n", colorBoldMagenta, domain, colorReset)
+		memforgeDomainProfileSummaryDebugPrint(MemforgeDomainProfileSummarize(domainBuckets))
+		for _, bucket := range domainBuckets {
+			memforgeProfileBucketDebugPrint(bucket)
+		}
+	}
+	if len(ungrouped) > 0 {
+		fmt.Printf("\n%s  Ungrouped%s\n", colorBoldMagenta, colorReset)
+		memforgeDomainProfileSummaryDebugPrint(MemforgeDomainProfileSummarize(ungrouped))
+		for _, bucket := range ungrouped {
+			memforgeProfileBucketDebugPrint(bucket)
+		}
+	}
+}
+
+func memforgeDomainProfileSummaryDebugPrint(summary MemforgeDomainProfileSummary) {
+	fmt.Printf("    %sSummary :%s %d types | %d arenas (%d active, %d destroyed)\n",
+		colorWhite, colorReset,
+		summary.BucketCount,
+		summary.InstanceCount,
+		summary.ActiveCount,
+		summary.DestroyedCount)
+	line := fmt.Sprintf("    %sSizing  :%s Configured %s",
+		colorWhite, colorReset,
+		humanBytes(float64(summary.ConfiguredCapBytes)))
+	if summary.MappableCapBytes > 0 || summary.OpaqueCapBytes > 0 {
+		line += fmt.Sprintf(" %s[Mappable: %s | Opaque: %s]%s",
+			colorGray,
+			humanBytes(float64(summary.MappableCapBytes)),
+			humanBytes(float64(summary.OpaqueCapBytes)),
+			colorReset)
+	}
+	line += fmt.Sprintf(" | Max peak %s | Ever %s\n",
+		humanBytes(float64(summary.MaxPeakBytes)),
+		humanBytes(float64(summary.TotalEverBytes)))
+	fmt.Print(line)
 }
 
 func memforgeProfileBucketDebugPrint(bucket MemforgeArenaProfileBucket) {

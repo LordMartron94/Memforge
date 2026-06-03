@@ -97,4 +97,8 @@ type MemforgeMemoryDebugParams struct {
 	StackFilter         MemforgeStackFilter
 	SizingVerdictFilter MemforgeSizingVerdictFilter
 	Timeline            MemforgeMemoryTimelineRenderParams
+
+	// DomainGroups maps a domain label to functional allocator tags supplied at allocator creation.
+	// When non-empty, the debugger prints profile buckets grouped under each domain.
+	DomainGroups map[string][]string
 }

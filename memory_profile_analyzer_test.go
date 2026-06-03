@@ -158,3 +158,74 @@ func TestMemforgeSizingVerdictFilterTagPolicies(t *testing.T) {
 func boolPtr(v bool) *bool {
 	return &v
 }
+
+func TestMemforgeDomainGroupBuckets(t *testing.T) {
+	buckets := []MemforgeArenaProfileBucket{
+		{Tag: "Renderer Core", DisplayLabel: "core"},
+		{Tag: "API Scratch", DisplayLabel: "scratch"},
+		{Tag: "Gameplay", DisplayLabel: "game"},
+		{Tag: "", DisplayLabel: "untagged", SiteLine: "main.main"},
+	}
+	domainGroups := map[string][]string{
+		"Renderer": {"Renderer Core"},
+		"Vulkan":   {"API Scratch"},
+		"Tutorial": {"Gameplay"},
+	}
+
+	buckets[0].InstanceCount = 3
+	buckets[0].ConfiguredCapBytes = 3000
+	buckets[0].MaxPeakBytes = 900
+
+	grouped, ungrouped := MemforgeDomainGroupBuckets(buckets, domainGroups)
+	if len(grouped["Renderer"]) != 1 || grouped["Renderer"][0].Tag != "Renderer Core" {
+		t.Fatalf("unexpected renderer buckets: %+v", grouped["Renderer"])
+	}
+	if len(grouped["Vulkan"]) != 1 || grouped["Vulkan"][0].Tag != "API Scratch" {
+		t.Fatalf("unexpected vulkan buckets: %+v", grouped["Vulkan"])
+	}
+	if len(grouped["Tutorial"]) != 1 {
+		t.Fatalf("unexpected tutorial buckets: %+v", grouped["Tutorial"])
+	}
+	if len(ungrouped) != 1 || ungrouped[0].DisplayLabel != "untagged" {
+		t.Fatalf("expected one ungrouped bucket, got %+v", ungrouped)
+	}
+
+	summary := MemforgeDomainProfileSummarize(grouped["Renderer"])
+	if summary.BucketCount != 1 || summary.InstanceCount != 3 || summary.ConfiguredCapBytes != 3000 {
+		t.Fatalf("unexpected renderer summary: %+v", summary)
+	}
+	if summary.MaxPeakBytes != 900 {
+		t.Fatalf("expected max peak 900, got %d", summary.MaxPeakBytes)
+	}
+}
+
+func TestMemforgeDomainProfileSummarize(t *testing.T) {
+	buckets := []MemforgeArenaProfileBucket{
+		{
+			InstanceCount:      2,
+			ActiveCount:        1,
+			DestroyedCount:     1,
+			ConfiguredCapBytes: 1024,
+			MaxPeakBytes:       512,
+			TotalEverBytes:     400,
+		},
+		{
+			OpaqueBacking:      true,
+			InstanceCount:      1,
+			ActiveCount:        1,
+			ConfiguredCapBytes: 2048,
+			MaxPeakBytes:       1024,
+			TotalEverBytes:     800,
+		},
+	}
+	summary := MemforgeDomainProfileSummarize(buckets)
+	if summary.BucketCount != 2 || summary.InstanceCount != 3 || summary.ActiveCount != 2 {
+		t.Fatalf("unexpected counts: %+v", summary)
+	}
+	if summary.ConfiguredCapBytes != 3072 || summary.MappableCapBytes != 1024 || summary.OpaqueCapBytes != 2048 {
+		t.Fatalf("unexpected cap split: %+v", summary)
+	}
+	if summary.MaxPeakBytes != 1024 || summary.TotalEverBytes != 1200 {
+		t.Fatalf("unexpected peaks or ever bytes: %+v", summary)
+	}
+}
